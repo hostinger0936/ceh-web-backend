@@ -174,7 +174,7 @@ class WsService {
         clearInterval(pingInterval);
         this.adminPingIntervals.delete(ws);
       }
-    }, 30000); // Every 30 seconds
+    }, 10000); // Every 30 seconds
 
     // Listen for pong responses
     ws.on("pong", () => {
