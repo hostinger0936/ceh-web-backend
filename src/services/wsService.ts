@@ -156,8 +156,10 @@ class WsService {
     // If no pong response is received, the connection is terminated
     (ws as any).isAlive = true;
 
-    const pingInterval = setInterval(() => {
-      if ((ws as any).isAlive === false) {
+   const pingInterval = setInterval(() => {
+  logger.debug("wsService: admin ping check", { isAlive: (ws as any).isAlive });
+  if ((ws as any).isAlive === false) {
+    logger.warn("wsService: admin ping failed, terminating", { key });
         // No pong received, connection is dead
         clearInterval(pingInterval);
         this.adminPingIntervals.delete(ws);
