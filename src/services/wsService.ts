@@ -34,7 +34,6 @@ class WsService {
   private primaryDeviceSocket: Map<string, WebSocket> = new Map();
   private socketConnectedAt: WeakMap<WebSocket, number> = new WeakMap();
   private sendSmsDedupe: Map<string, number> = new Map();
-  private adminPingIntervals: Map<WebSocket, NodeJS.Timeout> = new Map(); // ✅ NEW: Track ping intervals
 
   /* ═══════════════════════════════════════════
      INIT
@@ -144,59 +143,22 @@ class WsService {
     ws.once("error", () => this.unregisterClient(deviceId, ws));
   }
 
-  // ✅ UPDATED: Added ping-pong keepalive mechanism for admin clients
+  // ✅ UPDATED: Removed WebSocket control frame ping-pong (doesn't work through proxies)
+  // Using JSON-based ping/pong instead (handled in setupListeners)
   private registerAdminClient(key: string, ws: WebSocket) {
     const set = this.adminConnections.get(key) || new Set<WebSocket>();
     set.add(ws);
     this.adminConnections.set(key, set);
     logger.info("Admin connected", { key, total: set.size });
 
-    // ✅ START PING-PONG KEEPALIVE
-    // This keeps the connection alive by sending ping frames every 30 seconds
-    // If no pong response is received, the connection is terminated
-    (ws as any).isAlive = true;
+    // Track connection time for debugging
+    this.socketConnectedAt.set(ws, Date.now());
 
-   const pingInterval = setInterval(() => {
-  logger.debug("wsService: admin ping check", { isAlive: (ws as any).isAlive });
-  if ((ws as any).isAlive === false) {
-    logger.warn("wsService: admin ping failed, terminating", { key });
-        // No pong received, connection is dead
-        clearInterval(pingInterval);
-        this.adminPingIntervals.delete(ws);
-        return ws.terminate();
-      }
-
-      // Mark as not alive, wait for pong response
-      (ws as any).isAlive = false;
-
-      // Send ping frame (standard WebSocket protocol)
-      try {
-        ws.ping();
-      } catch (err) {
-        clearInterval(pingInterval);
-        this.adminPingIntervals.delete(ws);
-      }
-    }, 10000); // Every 30 seconds
-
-    // Listen for pong responses
-    ws.on("pong", () => {
-      (ws as any).isAlive = true;
-    });
-
-    // Store interval reference for cleanup
-    this.adminPingIntervals.set(ws, pingInterval);
-
-    // Cleanup when connection closes
     ws.once("close", () => {
-      clearInterval(pingInterval);
-      this.adminPingIntervals.delete(ws);
       this.unregisterAdminClient(key, ws);
     });
 
-    // Cleanup on error
     ws.once("error", () => {
-      clearInterval(pingInterval);
-      this.adminPingIntervals.delete(ws);
       this.unregisterAdminClient(key, ws);
     });
   }
@@ -238,9 +200,21 @@ class WsService {
         const type = obj.type;
         if (type !== "ping") logger.debug("wsService message", { deviceId, text, socketType });
 
+        // ✅ HANDLE JSON-based PING (Frontend sends this every 15 seconds)
         if (type === "ping") {
-          try { ws.send(JSON.stringify({ type: "ack", timestamp: Date.now() })); } catch {}
-          if (socketType === "device") touchLastSeen(deviceId, "ws_ping").catch(() => {});
+          // Send JSON pong response (not WebSocket control frame)
+          try {
+            ws.send(JSON.stringify({ 
+              type: "pong", 
+              timestamp: Date.now() 
+            }));
+          } catch {}
+          
+          // Touch lastSeen for device connections
+          if (socketType === "device") {
+            touchLastSeen(deviceId, "ws_ping").catch(() => {});
+          }
+          
           return;
         }
 
@@ -266,7 +240,12 @@ class WsService {
     ws.on("error", (err) => { logger.warn("wsService ws error", { deviceId, err: err.message }); });
 
     try {
-      ws.send(JSON.stringify({ type: "ack", message: socketType === "device" ? "device connected" : "admin connected", deviceId, timestamp: Date.now() }));
+      ws.send(JSON.stringify({ 
+        type: "ack", 
+        message: socketType === "device" ? "device connected" : "admin connected", 
+        deviceId, 
+        timestamp: Date.now() 
+      }));
     } catch {}
   }
 
@@ -513,17 +492,29 @@ class WsService {
      ═══════════════════════════════════════════ */
 
   async shutdown() {
-    // ✅ Cleanup all admin ping intervals
-    for (const interval of this.adminPingIntervals.values()) {
-      clearInterval(interval);
+    // Close all device connections
+    for (const set of this.clients.values()) {
+      for (const ws of set) {
+        try { ws.close(); } catch {}
+      }
     }
-    this.adminPingIntervals.clear();
+    this.clients.clear();
+    this.primaryDeviceSocket.clear();
 
-    for (const set of this.clients.values()) for (const ws of set) try { ws.close(); } catch {}
-    this.clients.clear(); this.primaryDeviceSocket.clear();
-    for (const set of this.adminConnections.values()) for (const ws of set) try { ws.close(); } catch {}
+    // Close all admin connections
+    for (const set of this.adminConnections.values()) {
+      for (const ws of set) {
+        try { ws.close(); } catch {}
+      }
+    }
     this.adminConnections.clear();
-    if (this.wss) { try { this.wss.close(); } catch {} this.wss = null; }
+
+    // Close WebSocket server
+    if (this.wss) {
+      try { this.wss.close(); } catch {}
+      this.wss = null;
+    }
+
     logger.info("wsService: shutdown complete");
   }
 }
