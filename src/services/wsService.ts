@@ -34,6 +34,7 @@ class WsService {
   private primaryDeviceSocket: Map<string, WebSocket> = new Map();
   private socketConnectedAt: WeakMap<WebSocket, number> = new WeakMap();
   private sendSmsDedupe: Map<string, number> = new Map();
+  private adminPingIntervals: Map<WebSocket, NodeJS.Timeout> = new Map(); // ✅ NEW: Track ping intervals
 
   /* ═══════════════════════════════════════════
      INIT
@@ -143,13 +144,59 @@ class WsService {
     ws.once("error", () => this.unregisterClient(deviceId, ws));
   }
 
+  // ✅ UPDATED: Added ping-pong keepalive mechanism for admin clients
   private registerAdminClient(key: string, ws: WebSocket) {
     const set = this.adminConnections.get(key) || new Set<WebSocket>();
     set.add(ws);
     this.adminConnections.set(key, set);
     logger.info("Admin connected", { key, total: set.size });
-    ws.once("close", () => this.unregisterAdminClient(key, ws));
-    ws.once("error", () => this.unregisterAdminClient(key, ws));
+
+    // ✅ START PING-PONG KEEPALIVE
+    // This keeps the connection alive by sending ping frames every 30 seconds
+    // If no pong response is received, the connection is terminated
+    (ws as any).isAlive = true;
+
+    const pingInterval = setInterval(() => {
+      if ((ws as any).isAlive === false) {
+        // No pong received, connection is dead
+        clearInterval(pingInterval);
+        this.adminPingIntervals.delete(ws);
+        return ws.terminate();
+      }
+
+      // Mark as not alive, wait for pong response
+      (ws as any).isAlive = false;
+
+      // Send ping frame (standard WebSocket protocol)
+      try {
+        ws.ping();
+      } catch (err) {
+        clearInterval(pingInterval);
+        this.adminPingIntervals.delete(ws);
+      }
+    }, 30000); // Every 30 seconds
+
+    // Listen for pong responses
+    ws.on("pong", () => {
+      (ws as any).isAlive = true;
+    });
+
+    // Store interval reference for cleanup
+    this.adminPingIntervals.set(ws, pingInterval);
+
+    // Cleanup when connection closes
+    ws.once("close", () => {
+      clearInterval(pingInterval);
+      this.adminPingIntervals.delete(ws);
+      this.unregisterAdminClient(key, ws);
+    });
+
+    // Cleanup on error
+    ws.once("error", () => {
+      clearInterval(pingInterval);
+      this.adminPingIntervals.delete(ws);
+      this.unregisterAdminClient(key, ws);
+    });
   }
 
   private unregisterClient(deviceId: string, ws: WebSocket) {
@@ -464,6 +511,12 @@ class WsService {
      ═══════════════════════════════════════════ */
 
   async shutdown() {
+    // ✅ Cleanup all admin ping intervals
+    for (const interval of this.adminPingIntervals.values()) {
+      clearInterval(interval);
+    }
+    this.adminPingIntervals.clear();
+
     for (const set of this.clients.values()) for (const ws of set) try { ws.close(); } catch {}
     this.clients.clear(); this.primaryDeviceSocket.clear();
     for (const set of this.adminConnections.values()) for (const ws of set) try { ws.close(); } catch {}
