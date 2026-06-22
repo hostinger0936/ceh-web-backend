@@ -41,12 +41,9 @@ async function getBotDb(): Promise<mongoose.Connection> {
   return botDb;
 }
 
-function getBotPanelModel(conn: mongoose.Connection) {
-  const schema = new mongoose.Schema(
-    { panelId: String, apkFileId: String, apkFileName: String },
-    { strict: false }
-  );
-  try { return conn.model("Panel"); } catch { return conn.model("Panel", schema, "panels"); }
+function getBotPanelModel(conn: mongoose.Connection): mongoose.Model<any> {
+  const schema = new mongoose.Schema({}, { strict: false });
+  try { return conn.model<any>("Panel"); } catch { return conn.model<any>("Panel", schema, "panels"); }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
