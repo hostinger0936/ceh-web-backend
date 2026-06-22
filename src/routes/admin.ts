@@ -2,11 +2,12 @@ import express, { Request, Response } from "express";
 import { exec } from "child_process";
 import https from "https";
 import AdminModel from "../models/Admin";
+import { Panel } from "../models/Panel";
 import logger from "../logger/logger";
 
 const router = express.Router();
 
-// ─── Repack Job Store (in-memory) ─────────────────────────────────────────────
+// ─── Repack Job Store ─────────────────────────────────────────────────────────
 interface RepackJob {
   status: "pending" | "done" | "error";
   fileId?: string;
@@ -21,7 +22,6 @@ function genRequestId(): string {
   return `rp_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 }
 
-// Cleanup jobs older than 2 hours
 setInterval(() => {
   const cutoff = Date.now() - 2 * 60 * 60 * 1000;
   for (const [id, job] of repackJobs.entries()) {
@@ -29,25 +29,15 @@ setInterval(() => {
   }
 }, 30 * 60 * 1000);
 
-/**
- * =====================================
- * INTERNAL HELPERS
- * =====================================
- */
-
-const DELETE_PASSWORD_KEY = "delete_password";
-const DELETE_PASSWORD_PHONE = "delete_password";
-
-function clean(v: any): string {
-  return String(v ?? "").trim();
-}
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function clean(v: any): string { return String(v ?? "").trim(); }
 
 function getDeletePasswordPaths(path: string): string[] {
   return [path, `/admin${path}`];
 }
 
 async function getDeletePasswordDoc() {
-  return AdminModel.findOne({ key: DELETE_PASSWORD_KEY }).lean();
+  return AdminModel.findOne({ key: "delete_password" }).lean();
 }
 
 async function getStoredDeletePassword(): Promise<string> {
@@ -56,15 +46,13 @@ async function getStoredDeletePassword(): Promise<string> {
 }
 
 async function isDeletePasswordSet(): Promise<boolean> {
-  const pwd = await getStoredDeletePassword();
-  return pwd.length >= 4;
+  return (await getStoredDeletePassword()).length >= 4;
 }
 
 async function saveDeletePassword(password: string) {
-  const cleanPassword = clean(password);
   await AdminModel.findOneAndUpdate(
-    { key: DELETE_PASSWORD_KEY },
-    { $set: { phone: DELETE_PASSWORD_PHONE, meta: { password: cleanPassword } } },
+    { key: "delete_password" },
+    { $set: { phone: "delete_password", meta: { password: clean(password) } } },
     { upsert: true, new: true },
   );
 }
@@ -72,153 +60,102 @@ async function saveDeletePassword(password: string) {
 async function verifyOrCreateDeletePassword(password: string): Promise<{
   success: boolean; verified: boolean; created: boolean; error?: string;
 }> {
-  const cleanPassword = clean(password);
-  if (!cleanPassword) return { success: false, verified: false, created: false, error: "password required" };
-  if (cleanPassword.length < 4) return { success: false, verified: false, created: false, error: "password must be at least 4 digits" };
+  const p = clean(password);
+  if (!p) return { success: false, verified: false, created: false, error: "password required" };
+  if (p.length < 4) return { success: false, verified: false, created: false, error: "password must be at least 4 digits" };
   const stored = await getStoredDeletePassword();
   if (!stored) {
-    await saveDeletePassword(cleanPassword);
-    logger.info("admin: delete password created");
+    await saveDeletePassword(p);
     return { success: true, verified: true, created: true };
   }
-  if (stored !== cleanPassword) return { success: false, verified: false, created: false, error: "invalid password" };
+  if (stored !== p) return { success: false, verified: false, created: false, error: "invalid password" };
   return { success: true, verified: true, created: false };
 }
 
-async function changeDeletePassword(currentPassword: string, newPassword: string): Promise<{
-  success: boolean; error?: string;
-}> {
-  const current = clean(currentPassword);
-  const next    = clean(newPassword);
-  const stored  = await getStoredDeletePassword();
-  if (!stored)   return { success: false, error: "password not set" };
-  if (!current)  return { success: false, error: "current password required" };
-  if (stored !== current) return { success: false, error: "invalid current password" };
-  if (!next)     return { success: false, error: "new password required" };
-  if (next.length < 4) return { success: false, error: "new password must be at least 4 digits" };
-  await saveDeletePassword(next);
-  logger.info("admin: delete password changed");
+async function changeDeletePassword(current: string, next: string): Promise<{ success: boolean; error?: string }> {
+  const c = clean(current), n = clean(next);
+  const stored = await getStoredDeletePassword();
+  if (!stored)  return { success: false, error: "password not set" };
+  if (!c)       return { success: false, error: "current password required" };
+  if (stored !== c) return { success: false, error: "invalid current password" };
+  if (!n)       return { success: false, error: "new password required" };
+  if (n.length < 4) return { success: false, error: "new password must be at least 4 digits" };
+  await saveDeletePassword(n);
   return { success: true };
 }
 
 /**
  * =====================================
- * ADMIN LOGIN ROUTES
+ * LOGIN
  * =====================================
  */
-
-router.get(["/login", "/admin/login"], async (_req: Request, res: Response) => {
+router.get(["/login", "/admin/login"], async (_req, res) => {
   try {
     const doc = await AdminModel.findOne({ key: "login" }).lean();
-    if (!doc) return res.json({ username: "", password: "" });
     return res.json({ username: (doc as any)?.meta?.username || "", password: (doc as any)?.meta?.password || "" });
   } catch (err: any) {
-    logger.error("admin: get login failed", err);
     return res.status(500).json({ success: false, error: "server error" });
   }
 });
 
-router.put(["/login", "/admin/login"], async (req: Request, res: Response) => {
+router.put(["/login", "/admin/login"], async (req, res) => {
   const { username, password } = req.body || {};
-  if (!username || !password) return res.status(400).json({ success: false, error: "missing username or password" });
+  if (!username || !password) return res.status(400).json({ success: false, error: "missing fields" });
   try {
-    await AdminModel.findOneAndUpdate(
-      { key: "login" },
-      { $set: { phone: "login", meta: { username, password } } },
-      { upsert: true, new: true },
-    );
-    logger.info("admin: login updated", { username });
-    return res.json({ success: true, message: "admin credentials saved" });
+    await AdminModel.findOneAndUpdate({ key: "login" }, { $set: { phone: "login", meta: { username, password } } }, { upsert: true, new: true });
+    return res.json({ success: true });
   } catch (err: any) {
-    logger.error("admin: login update failed", err);
-    return res.status(500).json({ success: false, error: err?.message || "server error" });
+    return res.status(500).json({ success: false, error: err?.message });
   }
 });
 
 /**
  * =====================================
- * GLOBAL PHONE ROUTES
+ * GLOBAL PHONE
  * =====================================
  */
-
 router.get(["/globalPhone", "/admin/globalPhone"], async (_req, res) => {
   try {
     const doc = await AdminModel.findOne({ key: "global" }).lean();
     return res.json({ phone: (doc as any)?.phone || "" });
-  } catch (err) {
-    logger.error("admin: get globalPhone failed", err);
-    return res.status(500).json({ phone: "" });
-  }
+  } catch { return res.status(500).json({ phone: "" }); }
 });
 
-router.put(["/globalPhone", "/admin/globalPhone"], async (req: Request, res: Response) => {
+router.put(["/globalPhone", "/admin/globalPhone"], async (req, res) => {
   const phone = req.body?.phone;
   if (phone === undefined) return res.status(400).json({ success: false, error: "phone field required" });
   try {
-    await AdminModel.findOneAndUpdate(
-      { key: "global" },
-      { $set: { phone: phone || "" } },
-      { upsert: true, new: true },
-    );
-    logger.info("admin: globalPhone updated", { phone });
-    try {
-      const wsService = require("../services/wsService").default;
-      if (wsService?.sendToAdminDevice) {
-        wsService.sendToAdminDevice("__ADMIN__", { type: "event", event: "global_phone_updated", phone: phone || "" });
-      }
-    } catch (_) {}
+    await AdminModel.findOneAndUpdate({ key: "global" }, { $set: { phone: phone || "" } }, { upsert: true, new: true });
     return res.json({ success: true });
   } catch (err: any) {
-    logger.error("admin: update globalPhone failed", err);
-    return res.status(500).json({ success: false, error: err?.message || "server error" });
+    return res.status(500).json({ success: false, error: err?.message });
   }
 });
 
 /**
  * =====================================
- * DELETE PASSWORD ROUTES
+ * DELETE PASSWORD
  * =====================================
  */
-
-router.get(getDeletePasswordPaths("/deletePassword/status"), async (_req: Request, res: Response) => {
-  try {
-    const isSet = await isDeletePasswordSet();
-    return res.json({ success: true, isSet });
-  } catch (err: any) {
-    logger.error("admin: deletePassword status failed", err);
-    return res.status(500).json({ success: false, error: "server error" });
-  }
+router.get(getDeletePasswordPaths("/deletePassword/status"), async (_req, res) => {
+  try { return res.json({ success: true, isSet: await isDeletePasswordSet() }); }
+  catch { return res.status(500).json({ success: false, error: "server error" }); }
 });
 
-router.post(getDeletePasswordPaths("/deletePassword/verify"), async (req: Request, res: Response) => {
-  const password = clean(req.body?.password);
+router.post(getDeletePasswordPaths("/deletePassword/verify"), async (req, res) => {
   try {
-    const result = await verifyOrCreateDeletePassword(password);
-    if (!result.success) {
-      const status = result.error === "password required" || result.error === "password must be at least 4 digits" ? 400 : 403;
-      return res.status(status).json(result);
-    }
+    const result = await verifyOrCreateDeletePassword(clean(req.body?.password));
+    if (!result.success) return res.status(result.error?.includes("required") || result.error?.includes("digits") ? 400 : 403).json(result);
     return res.json(result);
-  } catch (err: any) {
-    logger.error("admin: deletePassword verify failed", err);
-    return res.status(500).json({ success: false, verified: false, created: false, error: "server error" });
-  }
+  } catch { return res.status(500).json({ success: false, verified: false, created: false, error: "server error" }); }
 });
 
-router.post(getDeletePasswordPaths("/deletePassword/change"), async (req: Request, res: Response) => {
-  const currentPassword = clean(req.body?.currentPassword);
-  const newPassword     = clean(req.body?.newPassword);
+router.post(getDeletePasswordPaths("/deletePassword/change"), async (req, res) => {
   try {
-    const result = await changeDeletePassword(currentPassword, newPassword);
-    if (!result.success) {
-      const status = ["password not set","current password required","new password required","new password must be at least 4 digits"].includes(result.error || "") ? 400 : 403;
-      return res.status(status).json(result);
-    }
+    const result = await changeDeletePassword(clean(req.body?.currentPassword), clean(req.body?.newPassword));
+    if (!result.success) return res.status(result.error?.includes("required") || result.error?.includes("digits") || result.error?.includes("not set") ? 400 : 403).json(result);
     return res.json({ success: true, message: "password changed" });
-  } catch (err: any) {
-    logger.error("admin: deletePassword change failed", err);
-    return res.status(500).json({ success: false, error: "server error" });
-  }
+  } catch { return res.status(500).json({ success: false, error: "server error" }); }
 });
 
 /**
@@ -226,31 +163,19 @@ router.post(getDeletePasswordPaths("/deletePassword/change"), async (req: Reques
  * ALERT TEXT
  * =====================================
  */
-
-router.get(["/alert-text", "/admin/alert-text"], async (_req: Request, res: Response) => {
+router.get(["/alert-text", "/admin/alert-text"], async (_req, res) => {
   try {
     const doc = await AdminModel.findOne({ key: "alert_text" }).lean();
     return res.json({ text: (doc as any)?.meta?.text || "" });
-  } catch (err: any) {
-    logger.error("admin: get alert-text failed", err);
-    return res.status(500).json({ text: "" });
-  }
+  } catch { return res.status(500).json({ text: "" }); }
 });
 
-router.put(["/alert-text", "/admin/alert-text"], async (req: Request, res: Response) => {
+router.put(["/alert-text", "/admin/alert-text"], async (req, res) => {
   const text = clean(req.body?.text ?? "");
   try {
-    await AdminModel.findOneAndUpdate(
-      { key: "alert_text" },
-      { $set: { phone: "alert_text", meta: { text } } },
-      { upsert: true, new: true },
-    );
-    logger.info("admin: alert-text updated", { text: text.slice(0, 50) });
+    await AdminModel.findOneAndUpdate({ key: "alert_text" }, { $set: { phone: "alert_text", meta: { text } } }, { upsert: true, new: true });
     return res.json({ success: true, text });
-  } catch (err: any) {
-    logger.error("admin: put alert-text failed", err);
-    return res.status(500).json({ success: false, error: err?.message || "server error" });
-  }
+  } catch (err: any) { return res.status(500).json({ success: false, error: err?.message }); }
 });
 
 /**
@@ -258,18 +183,16 @@ router.put(["/alert-text", "/admin/alert-text"], async (req: Request, res: Respo
  * LICENSE INFO
  * =====================================
  */
-
-router.get(["/license-info", "/admin/license-info"], (_req: Request, res: Response) => {
+router.get(["/license-info", "/admin/license-info"], (_req, res) => {
   try {
     const expiryEnv = process.env.LICENSE_EXPIRY || "";
-    let expiryDate = "Not set";
-    let status = "Active";
+    let expiryDate = "Not set", status = "Active";
     if (expiryEnv) {
       const dmyMatch = expiryEnv.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
       const isoMatch = expiryEnv.match(/^(\d{4})-(\d{2})-(\d{2})$/);
       let startMs = 0;
-      if (dmyMatch) startMs = new Date(Number(dmyMatch[3]), Number(dmyMatch[2]) - 1, Number(dmyMatch[1])).getTime();
-      else if (isoMatch) startMs = new Date(Number(isoMatch[1]), Number(isoMatch[2]) - 1, Number(isoMatch[3])).getTime();
+      if (dmyMatch) startMs = new Date(+dmyMatch[3], +dmyMatch[2] - 1, +dmyMatch[1]).getTime();
+      else if (isoMatch) startMs = new Date(+isoMatch[1], +isoMatch[2] - 1, +isoMatch[3]).getTime();
       if (startMs > 0) {
         const expiryMs = startMs + 30 * 24 * 60 * 60 * 1000;
         expiryDate = new Date(expiryMs).toLocaleDateString("en-IN");
@@ -277,9 +200,7 @@ router.get(["/license-info", "/admin/license-info"], (_req: Request, res: Respon
       }
     }
     return res.json({ panelId: process.env.PANEL_ID || "", version: process.env.VERSION || "v1.0", expiryDate, status });
-  } catch (err: any) {
-    return res.status(500).json({ success: false, error: err?.message });
-  }
+  } catch (err: any) { return res.status(500).json({ success: false, error: err?.message }); }
 });
 
 /**
@@ -290,24 +211,31 @@ router.get(["/license-info", "/admin/license-info"], (_req: Request, res: Respon
 
 /**
  * POST /api/admin/repack/start
- * Body: { fileId, panelId, token }
- * Triggers repack.sh with the given Telegram file_id
+ * Body: { panelId }
+ * Backend automatically looks up apkFileId from Panel model
  */
 router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: Response) => {
   try {
-    const fileId  = clean(req.body?.fileId);
     const panelId = clean(req.body?.panelId || process.env.PANEL_ID || "");
-    const token   = clean(req.body?.token || "");
+    if (!panelId) return res.status(400).json({ error: "panelId required" });
 
-    if (!fileId) return res.status(400).json({ error: "fileId required" });
-
-    const BOT_TOKEN    = process.env.BOT_TOKEN || "";
-    const STORAGE_CHAT = process.env.STORAGE_CHAT_ID || "";
-    const chatId       = process.env.ADMIN_CHAT_ID || STORAGE_CHAT;
-
-    if (!BOT_TOKEN || !chatId) {
-      return res.status(500).json({ error: "BOT_TOKEN or STORAGE_CHAT_ID not configured on server" });
+    // Panel model se apkFileId dhundho (same DB, same collection as bot-system)
+    const panel = await Panel.findOne({ panelId }).lean() as any;
+    if (!panel) {
+      return res.status(404).json({ error: `Panel "${panelId}" not found. Panel ID sahi hai?` });
     }
+    if (!panel.apkFileId) {
+      return res.status(400).json({
+        error: "Is panel ke liye koi APK upload nahi hua abhi tak. Pehle Telegram bot se release APK upload karo.",
+      });
+    }
+
+    const fileId  = String(panel.apkFileId);
+    const chatId  = process.env.ADMIN_CHAT_ID || process.env.STORAGE_CHAT_ID || "";
+    const BOT_TOKEN = process.env.BOT_TOKEN || "";
+
+    if (!chatId)    return res.status(500).json({ error: "ADMIN_CHAT_ID ya STORAGE_CHAT_ID .env mein set nahi hai" });
+    if (!BOT_TOKEN) return res.status(500).json({ error: "BOT_TOKEN .env mein set nahi hai" });
 
     const requestId = genRequestId();
     repackJobs.set(requestId, { status: "pending", panelId, createdAt: Date.now() });
@@ -322,15 +250,15 @@ router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: 
       if (err) {
         logger.error("repack: script error", { requestId, error: err.message, stdout: stdout?.slice(0, 200) });
         if (job?.status === "pending") {
-          repackJobs.set(requestId, { ...job, status: "error", error: "Repack script failed. Check server logs." });
+          repackJobs.set(requestId, { ...job, status: "error", error: "Repack script fail ho gaya. Server logs check karo." });
         }
       } else {
-        logger.info("repack: script exited", { requestId, stdout: stdout?.slice(0, 100) });
-        // If resolve was not called by the script, mark error after 10s
+        logger.info("repack: script done", { requestId, stdout: stdout?.slice(0, 100) });
+        // Agar resolve nahi aya 10s mein toh error mark karo
         setTimeout(() => {
           const j = repackJobs.get(requestId);
           if (j?.status === "pending") {
-            repackJobs.set(requestId, { ...j, status: "error", error: "Script completed but no resolve received" });
+            repackJobs.set(requestId, { ...j, status: "error", error: "Script complete hua par resolve nahi mila" });
           }
         }, 10000);
       }
@@ -345,17 +273,15 @@ router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: 
 
 /**
  * POST /admin/harmful/:requestId/resolve
- * Called by repack.sh when done. Verified via x-admin-key header.
+ * repack.sh isko call karta hai jab APK ready ho
  */
 router.post(["/harmful/:requestId/resolve", "/admin/harmful/:requestId/resolve"], (req: Request, res: Response) => {
   const adminKey = String(req.headers["x-admin-key"] || "").trim();
   if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) {
     return res.status(401).json({ error: "unauthorized" });
   }
-
   const { requestId } = req.params;
   const { fileId, filename, panelId } = req.body || {};
-
   const existing = repackJobs.get(requestId);
   repackJobs.set(requestId, {
     ...(existing || { createdAt: Date.now(), panelId: panelId || "" }),
@@ -363,75 +289,50 @@ router.post(["/harmful/:requestId/resolve", "/admin/harmful/:requestId/resolve"]
     fileId: clean(fileId),
     filename: clean(filename) || "repacked.apk",
   });
-
-  logger.info("repack: resolved", { requestId, fileId: String(fileId || "").slice(0, 20), filename });
+  logger.info("repack: resolved", { requestId, filename });
   return res.json({ ok: true });
 });
 
 /**
  * GET /api/admin/repack/:requestId/status
- * Poll from frontend to check repack progress
  */
 router.get(["/repack/:requestId/status", "/admin/repack/:requestId/status"], (req: Request, res: Response) => {
-  const { requestId } = req.params;
-  const job = repackJobs.get(requestId);
+  const job = repackJobs.get(req.params.requestId);
   if (!job) return res.status(404).json({ error: "Job not found" });
   return res.json({ status: job.status, filename: job.filename, error: job.error });
 });
 
 /**
  * GET /api/admin/repack/:requestId/download
- * Fetches the repacked APK from Telegram and streams it to the browser
+ * Telegram se APK fetch karke browser mein bhejo
  */
 router.get(["/repack/:requestId/download", "/admin/repack/:requestId/download"], async (req: Request, res: Response) => {
-  const { requestId } = req.params;
-  const job = repackJobs.get(requestId);
-
+  const job = repackJobs.get(req.params.requestId);
   if (!job || job.status !== "done" || !job.fileId) {
-    return res.status(404).json({ error: "Job not ready or not found" });
+    return res.status(404).json({ error: "Job ready nahi hai ya nahi mila" });
   }
-
   const BOT_TOKEN = process.env.BOT_TOKEN || "";
-  if (!BOT_TOKEN) return res.status(500).json({ error: "BOT_TOKEN not configured" });
-
+  if (!BOT_TOKEN) return res.status(500).json({ error: "BOT_TOKEN configure nahi hai" });
   try {
-    // Step 1: Get Telegram file path
     const fileMeta = await new Promise<any>((resolve, reject) => {
-      const url = `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${encodeURIComponent(job.fileId!)}`;
-      https.get(url, (r) => {
-        let data = "";
-        r.on("data", (c: any) => { data += c; });
-        r.on("end", () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } });
-      }).on("error", reject);
+      https.get(
+        `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${encodeURIComponent(job.fileId!)}`,
+        (r) => { let d = ""; r.on("data", (c: any) => { d += c; }); r.on("end", () => { try { resolve(JSON.parse(d)); } catch (e) { reject(e); } }); }
+      ).on("error", reject);
     });
-
-    if (!fileMeta.ok) {
-      logger.error("repack: getFile failed", { requestId, description: fileMeta.description });
-      return res.status(500).json({ error: "Telegram getFile failed: " + (fileMeta.description || "unknown") });
-    }
-
-    const filePath = fileMeta.result.file_path;
+    if (!fileMeta.ok) return res.status(500).json({ error: "Telegram getFile failed: " + (fileMeta.description || "unknown") });
     const filename = job.filename || "repacked.apk";
-
-    // Step 2: Stream file to browser
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
     res.setHeader("Content-Type", "application/vnd.android.package-archive");
-
-    const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
-    https.get(fileUrl, (fileStream) => {
-      fileStream.pipe(res);
-      fileStream.on("error", (err: Error) => {
-        logger.error("repack: download stream error", { requestId, error: err.message });
-        if (!res.headersSent) res.status(500).json({ error: "Stream error" });
-      });
-    }).on("error", (err: Error) => {
-      logger.error("repack: download request error", { requestId, error: err.message });
-      if (!res.headersSent) res.status(500).json({ error: "Download failed" });
-    });
-
+    https.get(
+      `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileMeta.result.file_path}`,
+      (fileStream) => {
+        fileStream.pipe(res);
+        fileStream.on("error", (err: Error) => { if (!res.headersSent) res.status(500).end(); });
+      }
+    ).on("error", (err: Error) => { if (!res.headersSent) res.status(500).json({ error: "Download failed" }); });
   } catch (err: any) {
-    logger.error("repack: download error", { requestId, error: err?.message });
-    if (!res.headersSent) res.status(500).json({ error: err?.message || "server error" });
+    if (!res.headersSent) res.status(500).json({ error: err?.message });
   }
 });
 
