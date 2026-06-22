@@ -35,23 +35,14 @@ function getDeviceTelegramMeta(device: any, deviceId: string) {
   };
 }
 
-/**
- * deviceController.ts
- *
- * Thin controllers matching the routes.
- * Each controller responds with { success, error? } where appropriate.
- *
- * POST-MIGRATION:
- *   - updateStatus() REMOVED (no more status.online)
- *   - All device reachability handled by lastSeen
- */
-
+// ── FIX: doc store karo → WS broadcast → naya device panel mein live dikhega ──
 export async function upsertDevice(req: Request, res: Response) {
   const deviceId = req.params.deviceId;
   const body = req.body || {};
   try {
-    await deviceService.upsertDeviceMetadata(deviceId, body);
+    const doc = await deviceService.upsertDeviceMetadata(deviceId, body);
     logger.info("controller: upsertDevice", { deviceId });
+    try { if (doc) wsService.broadcastDeviceUpsert(doc); } catch {}
     return res.json({ success: true });
   } catch (err: any) {
     logger.error("controller: upsertDevice failed", err);
