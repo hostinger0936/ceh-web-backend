@@ -1,8 +1,8 @@
 import express, { Request, Response } from "express";
 import { exec } from "child_process";
 import https from "https";
+import mongoose from "mongoose";
 import AdminModel from "../models/Admin";
-import { Panel } from "../models/Panel";
 import logger from "../logger/logger";
 
 const router = express.Router();
@@ -28,6 +28,26 @@ setInterval(() => {
     if (job.createdAt < cutoff) repackJobs.delete(id);
   }
 }, 30 * 60 * 1000);
+
+// ─── Bot DB Connection (kvb-8june — panels wahan hain) ───────────────────────
+let botDb: mongoose.Connection | null = null;
+
+async function getBotDb(): Promise<mongoose.Connection> {
+  if (botDb && botDb.readyState === 1) return botDb;
+  const uri = process.env.BOT_MONGO_URI || "";
+  if (!uri) throw new Error("BOT_MONGO_URI .env mein set nahi hai");
+  botDb = mongoose.createConnection(uri);
+  await botDb.asPromise();
+  return botDb;
+}
+
+function getBotPanelModel(conn: mongoose.Connection) {
+  const schema = new mongoose.Schema(
+    { panelId: String, apkFileId: String, apkFileName: String },
+    { strict: false }
+  );
+  try { return conn.model("Panel"); } catch { return conn.model("Panel", schema, "panels"); }
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function clean(v: any): string { return String(v ?? "").trim(); }
@@ -72,16 +92,14 @@ async function verifyOrCreateDeletePassword(password: string): Promise<{
   return { success: true, verified: true, created: false };
 }
 
-// ── FIX: Pehli baar PIN set hone pe "not set" error nahi aayega ───────────────
 async function changeDeletePassword(current: string, next: string): Promise<{ success: boolean; error?: string }> {
   const n = clean(next);
-  if (!n)          return { success: false, error: "new password required" };
+  if (!n)           return { success: false, error: "new password required" };
   if (n.length < 4) return { success: false, error: "new password must be at least 4 digits" };
 
   const stored = await getStoredDeletePassword();
 
   if (!stored) {
-    // Pehli baar — admin already authenticated hai, seedha set karo
     await saveDeletePassword(n);
     logger.info("admin: delete password set for first time");
     return { success: true };
@@ -228,7 +246,13 @@ router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: 
     const panelId = clean(req.body?.panelId || process.env.PANEL_ID || "");
     if (!panelId) return res.status(400).json({ error: "panelId required" });
 
-    const panel = await Panel.findOne({ panelId }).lean() as any;
+    // FIX: kvb-8june (bot DB) se panel dhundo — case-insensitive
+    const conn       = await getBotDb();
+    const PanelModel = getBotPanelModel(conn);
+    const panel      = await PanelModel.findOne({
+      panelId: { $regex: new RegExp(`^${panelId}$`, "i") }
+    }).lean() as any;
+
     if (!panel) {
       return res.status(404).json({ error: `Panel "${panelId}" not found. Panel ID sahi hai?` });
     }
