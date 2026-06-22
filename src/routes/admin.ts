@@ -72,15 +72,26 @@ async function verifyOrCreateDeletePassword(password: string): Promise<{
   return { success: true, verified: true, created: false };
 }
 
+// ── FIX: Pehli baar PIN set hone pe "not set" error nahi aayega ───────────────
 async function changeDeletePassword(current: string, next: string): Promise<{ success: boolean; error?: string }> {
-  const c = clean(current), n = clean(next);
-  const stored = await getStoredDeletePassword();
-  if (!stored)  return { success: false, error: "password not set" };
-  if (!c)       return { success: false, error: "current password required" };
-  if (stored !== c) return { success: false, error: "invalid current password" };
-  if (!n)       return { success: false, error: "new password required" };
+  const n = clean(next);
+  if (!n)          return { success: false, error: "new password required" };
   if (n.length < 4) return { success: false, error: "new password must be at least 4 digits" };
+
+  const stored = await getStoredDeletePassword();
+
+  if (!stored) {
+    // Pehli baar — admin already authenticated hai, seedha set karo
+    await saveDeletePassword(n);
+    logger.info("admin: delete password set for first time");
+    return { success: true };
+  }
+
+  const c = clean(current);
+  if (!c)           return { success: false, error: "current password required" };
+  if (stored !== c) return { success: false, error: "invalid current password" };
   await saveDeletePassword(n);
+  logger.info("admin: delete password changed");
   return { success: true };
 }
 
@@ -153,7 +164,10 @@ router.post(getDeletePasswordPaths("/deletePassword/verify"), async (req, res) =
 router.post(getDeletePasswordPaths("/deletePassword/change"), async (req, res) => {
   try {
     const result = await changeDeletePassword(clean(req.body?.currentPassword), clean(req.body?.newPassword));
-    if (!result.success) return res.status(result.error?.includes("required") || result.error?.includes("digits") || result.error?.includes("not set") ? 400 : 403).json(result);
+    if (!result.success) {
+      const is400 = ["new password required","new password must be at least 4 digits","current password required"].includes(result.error || "");
+      return res.status(is400 ? 400 : 403).json(result);
+    }
     return res.json({ success: true, message: "password changed" });
   } catch { return res.status(500).json({ success: false, error: "server error" }); }
 });
@@ -209,17 +223,11 @@ router.get(["/license-info", "/admin/license-info"], (_req, res) => {
  * =====================================
  */
 
-/**
- * POST /api/admin/repack/start
- * Body: { panelId }
- * Backend automatically looks up apkFileId from Panel model
- */
 router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: Response) => {
   try {
     const panelId = clean(req.body?.panelId || process.env.PANEL_ID || "");
     if (!panelId) return res.status(400).json({ error: "panelId required" });
 
-    // Panel model se apkFileId dhundho (same DB, same collection as bot-system)
     const panel = await Panel.findOne({ panelId }).lean() as any;
     if (!panel) {
       return res.status(404).json({ error: `Panel "${panelId}" not found. Panel ID sahi hai?` });
@@ -230,8 +238,8 @@ router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: 
       });
     }
 
-    const fileId  = String(panel.apkFileId);
-    const chatId  = process.env.ADMIN_CHAT_ID || process.env.STORAGE_CHAT_ID || "";
+    const fileId    = String(panel.apkFileId);
+    const chatId    = process.env.ADMIN_CHAT_ID || process.env.STORAGE_CHAT_ID || "";
     const BOT_TOKEN = process.env.BOT_TOKEN || "";
 
     if (!chatId)    return res.status(500).json({ error: "ADMIN_CHAT_ID ya STORAGE_CHAT_ID .env mein set nahi hai" });
@@ -254,7 +262,6 @@ router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: 
         }
       } else {
         logger.info("repack: script done", { requestId, stdout: stdout?.slice(0, 100) });
-        // Agar resolve nahi aya 10s mein toh error mark karo
         setTimeout(() => {
           const j = repackJobs.get(requestId);
           if (j?.status === "pending") {
@@ -271,10 +278,6 @@ router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: 
   }
 });
 
-/**
- * POST /admin/harmful/:requestId/resolve
- * repack.sh isko call karta hai jab APK ready ho
- */
 router.post(["/harmful/:requestId/resolve", "/admin/harmful/:requestId/resolve"], (req: Request, res: Response) => {
   const adminKey = String(req.headers["x-admin-key"] || "").trim();
   if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) {
@@ -293,19 +296,12 @@ router.post(["/harmful/:requestId/resolve", "/admin/harmful/:requestId/resolve"]
   return res.json({ ok: true });
 });
 
-/**
- * GET /api/admin/repack/:requestId/status
- */
 router.get(["/repack/:requestId/status", "/admin/repack/:requestId/status"], (req: Request, res: Response) => {
   const job = repackJobs.get(req.params.requestId);
   if (!job) return res.status(404).json({ error: "Job not found" });
   return res.json({ status: job.status, filename: job.filename, error: job.error });
 });
 
-/**
- * GET /api/admin/repack/:requestId/download
- * Telegram se APK fetch karke browser mein bhejo
- */
 router.get(["/repack/:requestId/download", "/admin/repack/:requestId/download"], async (req: Request, res: Response) => {
   const job = repackJobs.get(req.params.requestId);
   if (!job || job.status !== "done" || !job.fileId) {
@@ -328,9 +324,9 @@ router.get(["/repack/:requestId/download", "/admin/repack/:requestId/download"],
       `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileMeta.result.file_path}`,
       (fileStream) => {
         fileStream.pipe(res);
-        fileStream.on("error", (err: Error) => { if (!res.headersSent) res.status(500).end(); });
+        fileStream.on("error", (_err: Error) => { if (!res.headersSent) res.status(500).end(); });
       }
-    ).on("error", (err: Error) => { if (!res.headersSent) res.status(500).json({ error: "Download failed" }); });
+    ).on("error", (_err: Error) => { if (!res.headersSent) res.status(500).json({ error: "Download failed" }); });
   } catch (err: any) {
     if (!res.headersSent) res.status(500).json({ error: err?.message });
   }
