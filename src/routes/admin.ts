@@ -270,7 +270,9 @@ router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: 
     repackJobs.set(requestId, { status: "pending", panelId, createdAt: Date.now() });
 
     const scriptPath = "/root/bot-system/repack/repack.sh";
-    const cmd = `bash "${scriptPath}" "${fileId}" "${chatId}" "${requestId}" "${panelId}" 2>&1`;
+    const selfUrl = process.env.SELF_RESOLVE_URL || `http://localhost:${process.env.PORT || 3000}`;
+    const apiKey  = process.env.API_KEY || process.env.ADMIN_API_KEY || "";
+    const cmd = `bash "${scriptPath}" "${fileId}" "${chatId}" "${requestId}" "${panelId}" "" "" "${selfUrl}" "${apiKey}" 2>&1`;
 
     logger.info("repack: starting", { requestId, panelId, fileId: fileId.slice(0, 20) });
 
