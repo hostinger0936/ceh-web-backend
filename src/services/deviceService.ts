@@ -329,7 +329,6 @@ export async function clearInvalidFcmToken(
       { deviceId },
       {
         $set: {
-          fcmToken: "__UNINSTALLED__",  // marker — empty string nahi, clear signal
           fcmLastError: reason || "invalid_token",
           fcmLastErrorAt: Date.now(),
         },
