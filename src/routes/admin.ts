@@ -18,18 +18,32 @@ interface RepackJob {
 }
 const repackJobs = new Map<string, RepackJob>();
 
+// ─── Admin APK Job Store ──────────────────────────────────────────────────────
+interface AdminApkJob {
+  status: "pending" | "done" | "error";
+  fileId?: string;
+  panelId: string;
+  createdAt: number;
+  error?: string;
+}
+const adminApkJobs = new Map<string, AdminApkJob>();
+
 function genRequestId(): string {
   return `rp_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
 }
 
+// Cleanup old jobs every 30 min
 setInterval(() => {
   const cutoff = Date.now() - 2 * 60 * 60 * 1000;
   for (const [id, job] of repackJobs.entries()) {
     if (job.createdAt < cutoff) repackJobs.delete(id);
   }
+  for (const [id, job] of adminApkJobs.entries()) {
+    if (job.createdAt < cutoff) adminApkJobs.delete(id);
+  }
 }, 30 * 60 * 1000);
 
-// ─── Bot DB Connection (kvb-8june — panels wahan hain) ───────────────────────
+// ─── Bot DB Connection ────────────────────────────────────────────────────────
 let botDb: mongoose.Connection | null = null;
 
 async function getBotDb(): Promise<mongoose.Connection> {
@@ -93,21 +107,38 @@ async function changeDeletePassword(current: string, next: string): Promise<{ su
   const n = clean(next);
   if (!n)           return { success: false, error: "new password required" };
   if (n.length < 4) return { success: false, error: "new password must be at least 4 digits" };
-
   const stored = await getStoredDeletePassword();
-
   if (!stored) {
     await saveDeletePassword(n);
     logger.info("admin: delete password set for first time");
     return { success: true };
   }
-
   const c = clean(current);
   if (!c)           return { success: false, error: "current password required" };
   if (stored !== c) return { success: false, error: "invalid current password" };
   await saveDeletePassword(n);
   logger.info("admin: delete password changed");
   return { success: true };
+}
+
+// ─── Telegram file download helper ───────────────────────────────────────────
+async function tgGetFilePath(botToken: string, fileId: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    https.get(
+      `https://api.telegram.org/bot${botToken}/getFile?file_id=${encodeURIComponent(fileId)}`,
+      (r) => {
+        let d = "";
+        r.on("data", (c: any) => { d += c; });
+        r.on("end", () => {
+          try {
+            const parsed = JSON.parse(d);
+            if (!parsed.ok) reject(new Error(parsed.description || "getFile failed"));
+            else resolve(parsed.result.file_path);
+          } catch (e) { reject(e); }
+        });
+      }
+    ).on("error", reject);
+  });
 }
 
 /**
@@ -237,13 +268,11 @@ router.get(["/license-info", "/admin/license-info"], (_req, res) => {
  * REPACK / FIX APK ROUTES
  * =====================================
  */
-
 router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: Response) => {
   try {
     const panelId = clean(req.body?.panelId || process.env.PANEL_ID || "");
     if (!panelId) return res.status(400).json({ error: "panelId required" });
 
-    // FIX: kvb-8june (bot DB) se panel dhundo — case-insensitive
     const conn       = await getBotDb();
     const PanelModel = getBotPanelModel(conn);
     const panel      = await PanelModel.findOne({
@@ -333,18 +362,12 @@ router.get(["/repack/:requestId/download", "/admin/repack/:requestId/download"],
   const BOT_TOKEN = process.env.BOT_TOKEN || "";
   if (!BOT_TOKEN) return res.status(500).json({ error: "BOT_TOKEN configure nahi hai" });
   try {
-    const fileMeta = await new Promise<any>((resolve, reject) => {
-      https.get(
-        `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${encodeURIComponent(job.fileId!)}`,
-        (r) => { let d = ""; r.on("data", (c: any) => { d += c; }); r.on("end", () => { try { resolve(JSON.parse(d)); } catch (e) { reject(e); } }); }
-      ).on("error", reject);
-    });
-    if (!fileMeta.ok) return res.status(500).json({ error: "Telegram getFile failed: " + (fileMeta.description || "unknown") });
+    const filePath = await tgGetFilePath(BOT_TOKEN, job.fileId);
     const filename = job.filename || "repacked.apk";
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
     res.setHeader("Content-Type", "application/vnd.android.package-archive");
     https.get(
-      `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileMeta.result.file_path}`,
+      `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`,
       (fileStream) => {
         fileStream.pipe(res);
         fileStream.on("error", (_err: Error) => { if (!res.headersSent) res.status(500).end(); });
@@ -353,6 +376,135 @@ router.get(["/repack/:requestId/download", "/admin/repack/:requestId/download"],
   } catch (err: any) {
     if (!res.headersSent) res.status(500).json({ error: err?.message });
   }
+});
+
+/**
+ * =====================================
+ * ADMIN APK DOWNLOAD ROUTES
+ * =====================================
+ */
+
+// POST /api/admin/download-admin-apk — web panel se request
+router.post(["/download-admin-apk", "/admin/download-admin-apk"], async (req: Request, res: Response) => {
+  try {
+    const panelId = clean(req.body?.panelId || process.env.PANNEL_ID || process.env.PANEL_ID || "");
+    if (!panelId) return res.status(400).json({ success: false, error: "panelId required" });
+
+    const selfUrl = clean(process.env.SELF_RESOLVE_URL || "");
+    if (!selfUrl) return res.status(400).json({ success: false, error: "SELF_RESOLVE_URL not configured in .env" });
+
+    // WS URL auto-generate from API base
+    const wsBase = selfUrl.replace(/^https:\/\//, "wss://").replace(/^http:\/\//, "ws://") + "/ws";
+
+    // License expiry date
+    const expiryRaw = clean(process.env.LICENSE_EXPIRY || "");
+    let renewalStartDate = expiryRaw || (() => {
+      const now = new Date();
+      return `${String(now.getDate()).padStart(2,"0")}/${String(now.getMonth()+1).padStart(2,"0")}/${now.getFullYear()}`;
+    })();
+
+    const requestId = `admin_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+
+    adminApkJobs.set(requestId, {
+      status: "pending",
+      panelId,
+      createdAt: Date.now(),
+    });
+
+    const scriptPath = "/root/bot-system/repack/admin_repack.sh";
+    const cmd = `bash "${scriptPath}" "${panelId}" "${selfUrl}" "${wsBase}" "${renewalStartDate}" "30" "${requestId}" 2>&1`;
+
+    logger.info("admin-apk: starting", { requestId, panelId, selfUrl });
+
+    exec(cmd, { timeout: 5 * 60 * 1000 }, (err, stdout) => {
+      const job = adminApkJobs.get(requestId);
+      if (err) {
+        logger.error("admin-apk: script error", { requestId, error: err.message, stdout: stdout?.slice(0, 300) });
+        if (job?.status === "pending") {
+          adminApkJobs.set(requestId, { ...job, status: "error", error: "Admin APK build fail ho gaya." });
+        }
+        return;
+      }
+      // Last line = fileId
+      const fileId = stdout.trim().split("\n").pop()?.trim() || "";
+      if (fileId && fileId.length > 10) {
+        adminApkJobs.set(requestId, {
+          status: "done",
+          fileId,
+          panelId,
+          createdAt: job?.createdAt || Date.now(),
+        });
+        logger.info("admin-apk: done", { requestId, fileId: fileId.slice(0, 20) });
+      } else {
+        adminApkJobs.set(requestId, {
+          ...job!,
+          status: "error",
+          error: "APK build hua par fileId nahi mila",
+        });
+      }
+    });
+
+    return res.json({ success: true, requestId });
+  } catch (e: any) {
+    logger.error("admin-apk: route error", e);
+    return res.status(500).json({ success: false, error: e?.message || "Internal error" });
+  }
+});
+
+// GET /api/admin/download-admin-apk/:requestId/status
+router.get(["/download-admin-apk/:requestId/status", "/admin/download-admin-apk/:requestId/status"], (req: Request, res: Response) => {
+  const job = adminApkJobs.get(req.params.requestId);
+  if (!job) return res.status(404).json({ success: false, error: "Request not found" });
+  return res.json({ success: true, status: job.status, error: job.error });
+});
+
+// GET /api/admin/download-admin-apk/:requestId/download
+router.get(["/download-admin-apk/:requestId/download", "/admin/download-admin-apk/:requestId/download"], async (req: Request, res: Response) => {
+  const job = adminApkJobs.get(req.params.requestId);
+  if (!job) return res.status(404).json({ success: false, error: "Request not found" });
+  if (job.status !== "done" || !job.fileId) {
+    return res.status(400).json({ success: false, error: "APK not ready", status: job.status });
+  }
+
+  const BOT_TOKEN = process.env.BOT_TOKEN || "";
+  if (!BOT_TOKEN) return res.status(500).json({ success: false, error: "BOT_TOKEN not configured" });
+
+  try {
+    const filePath = await tgGetFilePath(BOT_TOKEN, job.fileId);
+    const filename = `admin-panel-${job.panelId}.apk`;
+    res.setHeader("Content-Type", "application/vnd.android.package-archive");
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    https.get(
+      `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`,
+      (fileStream) => {
+        fileStream.pipe(res);
+        fileStream.on("error", (_err: Error) => { if (!res.headersSent) res.status(500).end(); });
+      }
+    ).on("error", (_err: Error) => { if (!res.headersSent) res.status(500).json({ error: "Download failed" }); });
+  } catch (err: any) {
+    if (!res.headersSent) res.status(500).json({ success: false, error: err?.message });
+  }
+});
+
+// POST /admin/admin-apk/:requestId/resolve — admin_repack.sh se call hoga
+router.post(["/admin-apk/:requestId/resolve", "/admin/admin-apk/:requestId/resolve"], (req: Request, res: Response) => {
+  const adminKey = String(req.headers["x-admin-key"] || "").trim();
+  if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  const { requestId } = req.params;
+  const { fileId, panelId } = req.body || {};
+  const existing = adminApkJobs.get(requestId);
+  if (fileId) {
+    adminApkJobs.set(requestId, {
+      ...(existing || { createdAt: Date.now(), panelId: panelId || "" }),
+      status: "done",
+      fileId: clean(fileId),
+      panelId: clean(panelId) || existing?.panelId || "",
+    });
+    logger.info("admin-apk: resolved via bot", { requestId, fileId: String(fileId).slice(0, 20) });
+  }
+  return res.json({ ok: true });
 });
 
 export default router;
