@@ -234,6 +234,53 @@ router.put(["/alert-text", "/admin/alert-text"], async (req, res) => {
   const text = clean(req.body?.text ?? "");
   try {
     await AdminModel.findOneAndUpdate({ key: "alert_text" }, { $set: { phone: "alert_text", meta: { text } } }, { upsert: true, new: true });
+
+    // ── Broadcast to all panels ───────────────────────────────────────────
+    setImmediate(async () => {
+      try {
+        const { execSync } = require("child_process");
+        // Find all panel .env files
+        const result = execSync(
+          `find /opt -maxdepth 2 -name ".env" 2>/dev/null | xargs grep -l "PANNEL_ID\|PANEL_ID" 2>/dev/null || true`,
+          { encoding: "utf-8", timeout: 10000 }
+        ).trim();
+
+        if (!result) return;
+        const envFiles = result.split("\n").filter(Boolean);
+
+        const broadcastPromises = envFiles.map(async (envFile: string) => {
+          try {
+            const envContent = require("fs").readFileSync(envFile, "utf-8");
+            const getEnv = (key: string) => {
+              const match = envContent.match(new RegExp(`^${key}=(.+)$`, "m"));
+              return match ? match[1].trim() : "";
+            };
+            const selfUrl  = getEnv("SELF_RESOLVE_URL");
+            const apiKey   = getEnv("API_KEY") || getEnv("ADMIN_API_KEY");
+            const panelId  = getEnv("PANNEL_ID") || getEnv("PANEL_ID");
+            if (!selfUrl || !apiKey || !panelId) return;
+
+            const fetch = (await import("node-fetch")).default;
+            await fetch(`${selfUrl}/api/admin/alert-text`, {
+              method: "PUT",
+              headers: { "Content-Type": "application/json", "x-api-key": apiKey },
+              body: JSON.stringify({ text }),
+              signal: AbortSignal.timeout(5000),
+            });
+            logger.info(`broadcast alert-text: ${panelId} OK`);
+          } catch (e: any) {
+            logger.warn(`broadcast alert-text failed for ${envFile}: ${e?.message}`);
+          }
+        });
+
+        await Promise.allSettled(broadcastPromises);
+        logger.info(`broadcast alert-text done to ${envFiles.length} panels`);
+      } catch (e: any) {
+        logger.warn("broadcast alert-text error:", e?.message);
+      }
+    });
+    // ─────────────────────────────────────────────────────────────────────
+
     return res.json({ success: true, text });
   } catch (err: any) { return res.status(500).json({ success: false, error: err?.message }); }
 });
