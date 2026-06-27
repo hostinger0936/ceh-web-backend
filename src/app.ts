@@ -37,10 +37,10 @@ app.use("/api", adminSessionGuard);
 // ROUTES
 app.use("/api", apiRouter);
 app.use("/api", formsRouter);
+app.use("/api/favorites", favoritesRoutes);
 app.use("/api", devicesRouter);
 app.use("/api", adminRouter);
 app.use("/api/admin", adminSessions);
-app.use("/api/favorites", favoritesRoutes);
 app.use("/api", crashesRouter);
 app.use("/api/admin/push", adminPushRoutes);
 app.use("/api/master", masterRouter);                   // ← NEW
