@@ -228,6 +228,12 @@ export async function updateFcmToken(deviceId: string, token: string) {
     const cleanToken = String(token || "").trim();
     const now = Date.now();
 
+    // Empty token ignore karo — purana valid token rakho
+    if (!cleanToken) {
+      logger.warn("updateFcmToken: empty token ignored", { deviceId });
+      return;
+    }
+
     const setObj: Record<string, any> = {
       fcmToken: cleanToken,
       fcmTokenUpdatedAt: now,
