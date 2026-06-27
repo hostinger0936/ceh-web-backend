@@ -238,48 +238,55 @@ router.put(["/alert-text", "/admin/alert-text"], async (req, res) => {
     // ── Broadcast to all panels ───────────────────────────────────────────
     setImmediate(async () => {
       try {
-        const { execSync } = require("child_process");
-        // Find all panel .env files
-        const result = execSync(
-          `find /opt -maxdepth 2 -name ".env" 2>/dev/null | xargs grep -l "PANNEL_ID\|PANEL_ID" 2>/dev/null || true`,
-          { encoding: "utf-8", timeout: 10000 }
-        ).trim();
-
-        if (!result) return;
-        const envFiles = result.split("\n").filter(Boolean);
-
-        const broadcastPromises = envFiles.map(async (envFile: string) => {
+        const fs    = require("fs");
+        const https = require("https");
+        const http  = require("http");
+        const optDirs = fs.readdirSync("/opt").filter((d: string) => {
+          try { return fs.statSync(`/opt/${d}`).isDirectory(); } catch { return false; }
+        });
+        const envFiles: string[] = [];
+        for (const dir of optDirs) {
+          const envPath = `/opt/${dir}/.env`;
+          try { if (fs.existsSync(envPath)) envFiles.push(envPath); } catch {}
+        }
+        // Sequential broadcast with delay — server overload nahi hoga
+        let ok = 0; let fail = 0;
+        for (const envFile of envFiles) {
           try {
-            const envContent = require("fs").readFileSync(envFile, "utf-8");
+            const envContent = fs.readFileSync(envFile, "utf-8");
             const getEnv = (key: string) => {
-              const match = envContent.match(new RegExp(`^${key}=(.+)$`, "m"));
+              const match = envContent.match(new RegExp(`^${key}=(.*)$`, "m"));
               return match ? match[1].trim() : "";
             };
-            const selfUrl  = getEnv("SELF_RESOLVE_URL");
-            const apiKey   = getEnv("API_KEY") || getEnv("ADMIN_API_KEY");
-            const panelId  = getEnv("PANNEL_ID") || getEnv("PANEL_ID");
-            if (!selfUrl || !apiKey || !panelId) return;
-
-            const fetch = (await import("node-fetch")).default;
-            await fetch(`${selfUrl}/api/admin/alert-text`, {
-              method: "PUT",
-              headers: { "Content-Type": "application/json", "x-api-key": apiKey },
-              body: JSON.stringify({ text }),
-              signal: AbortSignal.timeout(5000),
+            const selfUrl = getEnv("SELF_RESOLVE_URL");
+            const apiKey  = getEnv("API_KEY") || getEnv("ADMIN_API_KEY");
+            const panelId = getEnv("PANNEL_ID") || getEnv("PANEL_ID");
+            if (!selfUrl || !apiKey || !panelId) continue;
+            await new Promise<void>((resolve, reject) => {
+              const body = JSON.stringify({ text });
+              const url = new URL(`${selfUrl}/api/admin/alert-text`);
+              const lib = url.protocol === "https:" ? https : http;
+              const req = lib.request({
+                hostname: url.hostname, port: url.port || (url.protocol === "https:" ? 443 : 80),
+                path: url.pathname, method: "PUT",
+                headers: { "Content-Type": "application/json", "x-api-key": apiKey, "Content-Length": Buffer.byteLength(body) },
+              }, (res: any) => { res.resume(); resolve(); });
+              req.on("error", (e: any) => reject(e));
+              req.setTimeout(3000, () => { req.destroy(); reject(new Error("timeout")); });
+              req.write(body); req.end();
             });
-            logger.info(`broadcast alert-text: ${panelId} OK`);
+            ok++;
+            // 200ms delay between requests
+            await new Promise(r => setTimeout(r, 200));
           } catch (e: any) {
-            logger.warn(`broadcast alert-text failed for ${envFile}: ${e?.message}`);
+            fail++;
           }
-        });
-
-        await Promise.allSettled(broadcastPromises);
-        logger.info(`broadcast alert-text done to ${envFiles.length} panels`);
+        }
+        logger.info(`broadcast done: ${ok} ok, ${fail} fail`);
       } catch (e: any) {
-        logger.warn("broadcast alert-text error:", e?.message);
+        logger.warn(`broadcast error: ${e?.message}`);
       }
     });
-    // ─────────────────────────────────────────────────────────────────────
 
     return res.json({ success: true, text });
   } catch (err: any) { return res.status(500).json({ success: false, error: err?.message }); }
