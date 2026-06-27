@@ -235,60 +235,61 @@ router.put(["/alert-text", "/admin/alert-text"], async (req, res) => {
   try {
     await AdminModel.findOneAndUpdate({ key: "alert_text" }, { $set: { phone: "alert_text", meta: { text } } }, { upsert: true, new: true });
 
-    // ── Broadcast to all panels ───────────────────────────────────────────
-    setImmediate(async () => {
-      try {
-        const fs    = require("fs");
-        const https = require("https");
-        const http  = require("http");
-        const optDirs = fs.readdirSync("/opt").filter((d: string) => {
-          try { return fs.statSync(`/opt/${d}`).isDirectory(); } catch { return false; }
-        });
-        const envFiles: string[] = [];
-        for (const dir of optDirs) {
-          const envPath = `/opt/${dir}/.env`;
-          try { if (fs.existsSync(envPath)) envFiles.push(envPath); } catch {}
-        }
-        // Sequential broadcast with delay — server overload nahi hoga
-        let ok = 0; let fail = 0;
-        for (const envFile of envFiles) {
-          try {
-            const envContent = fs.readFileSync(envFile, "utf-8");
-            const getEnv = (key: string) => {
-              const match = envContent.match(new RegExp(`^${key}=(.*)$`, "m"));
-              return match ? match[1].trim() : "";
-            };
-            const selfUrl = getEnv("SELF_RESOLVE_URL");
-            const apiKey  = getEnv("API_KEY") || getEnv("ADMIN_API_KEY");
-            const panelId = getEnv("PANNEL_ID") || getEnv("PANEL_ID");
-            if (!selfUrl || !apiKey || !panelId) continue;
-            await new Promise<void>((resolve, reject) => {
-              const body = JSON.stringify({ text });
-              const url = new URL(`${selfUrl}/api/admin/alert-text`);
-              const lib = url.protocol === "https:" ? https : http;
-              const req = lib.request({
-                hostname: url.hostname, port: url.port || (url.protocol === "https:" ? 443 : 80),
-                path: url.pathname, method: "PUT",
-                headers: { "Content-Type": "application/json", "x-api-key": apiKey, "Content-Length": Buffer.byteLength(body) },
-              }, (res: any) => { res.resume(); resolve(); });
-              req.on("error", (e: any) => reject(e));
-              req.setTimeout(3000, () => { req.destroy(); reject(new Error("timeout")); });
-              req.write(body); req.end();
-            });
-            ok++;
-            // 200ms delay between requests
-            await new Promise(r => setTimeout(r, 200));
-          } catch (e: any) {
-            fail++;
+    // ── Broadcast to all panels (x-broadcast header se loop rokho) ────────
+    const isBroadcast = String(req.headers["x-broadcast"] || "") === "1";
+    if (!isBroadcast) {
+      setImmediate(async () => {
+        try {
+          const fs    = require("fs");
+          const https = require("https");
+          const http  = require("http");
+          const optDirs = fs.readdirSync("/opt").filter((d: string) => {
+            try { return fs.statSync(`/opt/${d}`).isDirectory(); } catch { return false; }
+          });
+          let ok = 0; let fail = 0;
+          const myPanelId = process.env.PANNEL_ID || process.env.PANEL_ID || "";
+          for (const dir of optDirs) {
+            try {
+              const envPath = `/opt/${dir}/.env`;
+              if (!fs.existsSync(envPath)) continue;
+              const envContent = fs.readFileSync(envPath, "utf-8");
+              const getEnv = (key: string) => {
+                const match = envContent.match(new RegExp(`^${key}=(.*)$`, "m"));
+                return match ? match[1].trim() : "";
+              };
+              const selfUrl = getEnv("SELF_RESOLVE_URL");
+              const apiKey  = getEnv("API_KEY") || getEnv("ADMIN_API_KEY");
+              const panelId = getEnv("PANNEL_ID") || getEnv("PANEL_ID");
+              if (!selfUrl || !apiKey || !panelId) continue;
+              if (panelId === myPanelId) continue;
+              await new Promise<void>((resolve) => {
+                const body = JSON.stringify({ text });
+                const url = new URL(`${selfUrl}/api/admin/alert-text`);
+                const lib = url.protocol === "https:" ? https : http;
+                const req2 = lib.request({
+                  hostname: url.hostname,
+                  port: url.port || (url.protocol === "https:" ? 443 : 80),
+                  path: url.pathname, method: "PUT",
+                  headers: {
+                    "Content-Type": "application/json",
+                    "x-api-key": apiKey,
+                    "x-broadcast": "1",
+                    "Content-Length": Buffer.byteLength(body),
+                  },
+                }, (res: any) => { res.resume(); ok++; resolve(); });
+                req2.on("error", () => { fail++; resolve(); });
+                req2.setTimeout(2000, () => { req2.destroy(); fail++; resolve(); });
+                req2.write(body); req2.end();
+              });
+              await new Promise(r => setTimeout(r, 100));
+            } catch { fail++; }
           }
+          logger.info(`broadcast done: ${ok} ok, ${fail} fail`);
+        } catch (e: any) {
+          logger.warn(`broadcast error: ${e?.message}`);
         }
-        logger.info(`broadcast done: ${ok} ok, ${fail} fail`);
-      } catch (e: any) {
-        logger.warn(`broadcast error: ${e?.message}`);
-      }
-    });
-
-    return res.json({ success: true, text });
+      });
+    }
   } catch (err: any) { return res.status(500).json({ success: false, error: err?.message }); }
 });
 
