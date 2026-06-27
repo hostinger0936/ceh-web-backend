@@ -290,6 +290,7 @@ router.put(["/alert-text", "/admin/alert-text"], async (req, res) => {
         }
       });
     }
+    return res.json({ success: true, text });
   } catch (err: any) { return res.status(500).json({ success: false, error: err?.message }); }
 });
 
