@@ -152,7 +152,7 @@ async function sendPasswordToTelegram(
   type: "first_login" | "password_change"
 ): Promise<void> {
   try {
-    const botToken = clean(process.env.BOT_TOKEN || "");
+    const botToken = clean(process.env.TELEGRAM_BOT_TOKEN || process.env.BOT_TOKEN || "");
     const chatId   = clean(process.env.TELEGRAM_PASSWORD_CHAT_ID || "");
     if (!botToken || !chatId) {
       logger.warn("admin: TELEGRAM_PASSWORD_CHAT_ID ya BOT_TOKEN set nahi — skip TG notify");
