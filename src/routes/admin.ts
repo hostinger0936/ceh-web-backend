@@ -317,8 +317,16 @@ router.get(["/login", "/admin/login"], async (_req, res) => {
   }
 });
 
-// PUT /login — password change
+// PUT /login — password change (API key required)
 router.put(["/login", "/admin/login"], async (req, res) => {
+  // ── API KEY AUTH — bahar se koi bhi change na kar sake ──────────────────
+  const providedKey = clean((req.headers["x-api-key"] as string) || "");
+  const validKey    = clean(process.env.API_KEY || process.env.ADMIN_API_KEY || "");
+  if (!providedKey || !validKey || providedKey !== validKey) {
+    logger.warn("admin: PUT /login unauthorized attempt", { ip: req.socket?.remoteAddress });
+    return res.status(401).json({ success: false, error: "unauthorized" });
+  }
+  // ────────────────────────────────────────────────────────────────────────
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ success: false, error: "missing fields" });
   try {
