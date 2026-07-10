@@ -105,19 +105,15 @@ export async function sendToDevice(
 ): Promise<{ success: boolean; messageId?: string; error?: string }> {
   const token = await getDeviceFcmToken(deviceId);
 
-  // Uninstalled device — permanent marker check
+  // Purane DB records mein kabhi kabhi __UNINSTALLED__ set hota tha — skip karo
   if (token === "__UNINSTALLED__") {
-    logger.info(`${TAG}: device is uninstalled (marker found)`, { deviceId });
+    logger.info(`${TAG}: device has __UNINSTALLED__ marker, clearing token`, { deviceId });
+    // Token clear karo taaki heartbeat isko baar baar na pakde
     try {
-      const wsService = require("./wsService").default;
-      wsService.broadcastAdminEvent("device:uninstalled", {
-        deviceId,
-        reason: "app_uninstalled",
-        timestamp: Date.now(),
-      }, { deviceId, includeDeviceChannel: true });
+      const { clearInvalidFcmToken } = await import("./deviceService");
+      await clearInvalidFcmToken(deviceId, "stale_uninstalled_marker");
     } catch (_) {}
-    await updateFcmSendMeta(deviceId, { lastAttemptAt: Date.now() });
-    return { success: false, error: "uninstalled" };
+    return { success: false, error: "missing_token" };
   }
 
   // No token — naya device, abhi sync nahi hua
