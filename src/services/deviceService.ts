@@ -324,37 +324,32 @@ export async function updateFcmSendMeta(
 /**
  * Clear invalid FCM token from device.
  * Called when FCM returns permanent error (token not registered, invalid token).
- * Also emits device:uninstalled WS event so admin panel knows app was uninstalled.
+ * Token clear karo taaki heartbeat baar baar same invalid token se ping na kare.
+ * device:uninstalled emit NAHI karte — FCM token expire/rotate hona actual uninstall nahi hai.
  */
 export async function clearInvalidFcmToken(
   deviceId: string,
   reason?: string,
 ) {
   try {
+    // Token clear karo — taaki heartbeat dobara isi invalid token se ping na kare
+    // Agar device wapas aaya to naya token register karega
     await Device.findOneAndUpdate(
       { deviceId },
       {
         $set: {
+          fcmToken: "",
           fcmLastError: reason || "invalid_token",
           fcmLastErrorAt: Date.now(),
         },
       },
     ).exec();
 
-    logger.warn("deviceService: cleared invalid FCM token", { deviceId, reason });
+    logger.warn("deviceService: FCM token cleared (invalid)", { deviceId, reason });
 
-    // Emit device:uninstalled WS event → admin panel shows "App Uninstalled ⚠️"
-    try {
-      const wsService = require("./wsService").default;
-      wsService.broadcastAdminEvent("device:uninstalled", {
-        deviceId,
-        reason: reason || "invalid_token",
-        timestamp: Date.now(),
-      }, { deviceId, includeDeviceChannel: true });
-      logger.info("deviceService: device:uninstalled emitted", { deviceId });
-    } catch (_) {
-      // ignore ws errors — DB update already succeeded
-    }
+    // device:uninstalled emit NAHI karte sirf token error pe — FCM token expire/rotate
+    // hona alag baat hai, actual uninstall alag baat. False positive se bacho.
+    // Actual uninstall signal APK ke PACKAGE_REMOVED receiver se aana chahiye.
   } catch (err: any) {
     logger.warn("deviceService: clearInvalidFcmToken failed", {
       deviceId,
