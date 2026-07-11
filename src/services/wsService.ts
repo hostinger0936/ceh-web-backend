@@ -204,10 +204,8 @@ class WsService {
         if (type === "ping") {
           // Send JSON pong response (not WebSocket control frame)
           try {
-            ws.send(JSON.stringify({ 
-              type: "pong", 
-              timestamp: Date.now() 
-            }));
+            ws.send(JSON.stringify({ type: "pong", timestamp: Date.now() }));
+            ws.send(JSON.stringify({ type: "ack", timestamp: Date.now() }));
           } catch {}
           
           // Touch lastSeen for device connections
