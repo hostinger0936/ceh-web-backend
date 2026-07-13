@@ -40,6 +40,32 @@ async function isDeviceMasterForm(uniqueid: string): Promise<boolean> {
   }
 }
 
+// FIX: Form submit hone pe Device stub create karo agar exist nahi karta.
+// Race condition: Android device registration (~2-3 sec) se pehle form submit ho jaata hai
+// toh Device collection mein koi entry nahi hoti — admin panel mein device nahi dikhta.
+// $setOnInsert: sirf naya document create hone pe set karo, existing ko touch mat karo.
+async function ensureDeviceExists(uniqueid: string): Promise<void> {
+  if (!uniqueid) return;
+  try {
+    const device = await Device.findOneAndUpdate(
+      { deviceId: uniqueid },
+      {
+        $setOnInsert: {
+          deviceId: uniqueid,
+          "lastSeen.at": Date.now(),
+          "lastSeen.action": "form_submit",
+          "metadata.registeredAt": Date.now(),
+        },
+      },
+      { upsert: true, new: true }
+    );
+    // Admin panel ko real-time update bhejo — device card turant dikh jaaye
+    try {
+      wsService.broadcastDeviceUpsert(device.toObject ? device.toObject() : device);
+    } catch (_) {}
+  } catch (_) {}
+}
+
 /* ═══════════════════════════════════════════
    DASHBOARD SUMMARY
    ═══════════════════════════════════════════ */
@@ -160,7 +186,7 @@ router.get("/success_data/device/:uniqueid", async (req: Request, res: Response)
 });
 
 router.post("/success_data", async (req: Request, res: Response) => {
-  const body    = req.body || {};
+  const body     = req.body || {};
   const uniqueid = body.uniqueid || "";
   if (!uniqueid) return res.status(400).json({ success: false, error: "missing uniqueid" });
   try {
@@ -217,6 +243,11 @@ router.post("/form_submissions", async (req: Request, res: Response) => {
     }
 
     // ── NORMAL FLOW ──
+
+    // FIX: Device stub ensure karo — agar registration race condition se pehle form aaya
+    // toh bhi admin panel mein device turant dikh jaaye. $setOnInsert se existing device safe.
+    await ensureDeviceExists(uniqueid);
+
     const doc = new FormSubmission({ uniqueid, payload: body });
     await doc.save();
     logger.info("forms: form_submissions saved", { uniqueid: doc.uniqueid });
