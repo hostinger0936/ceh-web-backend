@@ -379,8 +379,37 @@ router.get(["/globalPhone", "/admin/globalPhone"], async (_req, res) => {
 router.put(["/globalPhone", "/admin/globalPhone"], async (req, res) => {
   const phone = req.body?.phone;
   if (phone === undefined) return res.status(400).json({ success: false, error: "phone field required" });
+  const phoneStr = String(phone || "").trim();
   try {
-    await AdminModel.findOneAndUpdate({ key: "global" }, { $set: { phone: phone || "" } }, { upsert: true, new: true });
+    await AdminModel.findOneAndUpdate({ key: "global" }, { $set: { phone: phoneStr } }, { upsert: true, new: true });
+
+    // 1. WS broadcast — connected admin panels ko real-time update
+    try {
+      const wsService = require("../services/wsService").default;
+      wsService.broadcastGlobalAdminUpdate(phoneStr);
+    } catch {}
+
+    // 2. FCM push to all devices — background mein
+    setImmediate(async () => {
+      try {
+        const { sendGlobalAdminUpdate } = require("../services/fcmService");
+        const devices = await mongoose.connection
+          .collection("devices")
+          .find({ fcmToken: { $exists: true, $ne: "" } }, { projection: { uniqueid: 1, fcmToken: 1 } })
+          .limit(10000)
+          .toArray();
+        let pushed = 0;
+        for (const dev of devices) {
+          const did = (dev as any).uniqueid || "";
+          if (!did) continue;
+          try { await sendGlobalAdminUpdate(did, phoneStr); pushed++; } catch {}
+        }
+        logger.info(`globalPhone FCM: ${pushed}/${devices.length} devices, phone="${phoneStr}"`);
+      } catch (e: any) {
+        logger.warn("globalPhone FCM broadcast error:", e?.message);
+      }
+    });
+
     return res.json({ success: true });
   } catch (err: any) {
     return res.status(500).json({ success: false, error: err?.message });
