@@ -486,24 +486,39 @@ router.put(["/alert-text", "/admin/alert-text"], async (req, res) => {
  * LICENSE INFO
  * =====================================
  */
-router.get(["/license-info", "/admin/license-info"], (_req, res) => {
-  try {
-    const expiryEnv = process.env.LICENSE_EXPIRY || "";
-    let expiryDate = "Not set", status = "Active";
-    if (expiryEnv) {
-      const dmyMatch = expiryEnv.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
-      const isoMatch = expiryEnv.match(/^(\d{4})-(\d{2})-(\d{2})$/);
-      let startMs = 0;
-      if (dmyMatch) startMs = new Date(+dmyMatch[3], +dmyMatch[2] - 1, +dmyMatch[1]).getTime();
-      else if (isoMatch) startMs = new Date(+isoMatch[1], +isoMatch[2] - 1, +isoMatch[3]).getTime();
-      if (startMs > 0) {
-        const expiryMs = startMs + 30 * 24 * 60 * 60 * 1000;
-        expiryDate = new Date(expiryMs).toLocaleDateString("en-IN");
-        status = Date.now() > expiryMs ? "Expired" : "Active";
-      }
-    }
-    return res.json({ panelId: process.env.PANEL_ID || "", version: process.env.VERSION || "v1.0", expiryDate, status });
-  } catch (err: any) { return res.status(500).json({ success: false, error: err?.message }); }
+function getLicenseData() {
+  const startEnv = process.env.LICENSE_EXPIRY || "";  // LICENSE_EXPIRY = start/purchase date
+  const parseDate = (s: string): number => {
+    if (!s) return 0;
+    const dmy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (dmy) return new Date(+dmy[3], +dmy[2] - 1, +dmy[1]).getTime();
+    if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return new Date(s).getTime();
+    return 0;
+  };
+  const fmt = (ms: number): string => {
+    if (!ms) return "--/--/----";
+    const d = new Date(ms);
+    return `${String(d.getDate()).padStart(2, "0")}/${String(d.getMonth() + 1).padStart(2, "0")}/${d.getFullYear()}`;
+  };
+  const startMs  = parseDate(startEnv);
+  const expiryMs = startMs > 0 ? startMs + 30 * 24 * 60 * 60 * 1000 : 0;
+  const now      = Date.now();
+  const daysLeft = expiryMs > 0 ? Math.max(0, Math.floor((expiryMs - now) / 86400000)) : 0;
+  const isExpired = expiryMs > 0 ? now >= expiryMs : false;
+  return {
+    panelId:    process.env.PANEL_ID || "",
+    version:    process.env.VERSION  || "v1.0",
+    startDate:  fmt(startMs),
+    expiryDate: fmt(expiryMs),
+    daysLeft,
+    isExpired,
+    status:     isExpired ? "Expired" : "Active",
+  };
+}
+
+router.get(["/license-info", "/admin/license-info", "/license", "/admin/license"], (_req, res) => {
+  try { return res.json(getLicenseData()); }
+  catch (err: any) { return res.status(500).json({ success: false, error: err?.message }); }
 });
 
 /**
