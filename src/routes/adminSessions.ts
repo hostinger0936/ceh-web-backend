@@ -6,7 +6,7 @@ import wsService from "../services/wsService";
 
 const router = express.Router();
 
-const DEFAULT_SESSION_LIMIT = 5;
+const DEFAULT_SESSION_LIMIT = 25;
 const DEVELOPER_SECURITY_CODE = "agree";
 
 /* ═══════════════════════════════════════════
