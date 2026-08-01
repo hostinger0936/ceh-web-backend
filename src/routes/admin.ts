@@ -676,4 +676,33 @@ router.post(["/admin-apk/:requestId/resolve", "/admin/admin-apk/:requestId/resol
   return res.json({ ok: true });
 });
 
+// ─── Device Remarks ───────────────────────────────────────────────────────────
+router.get(["/device-remarks", "/admin/device-remarks"], async (_req: Request, res: Response) => {
+  try {
+    const docs = await AdminModel.find({ key: { $regex: /^device_remark_/ } }).lean();
+    const map: Record<string, string> = {};
+    for (const doc of docs) {
+      const deviceId = String((doc as any).key || "").replace("device_remark_", "");
+      const remark = String((doc as any)?.meta?.remark || "");
+      if (deviceId && remark) map[deviceId] = remark;
+    }
+    return res.json(map);
+  } catch { return res.status(500).json({}); }
+});
+
+router.put(["/device-remark/:deviceId", "/admin/device-remark/:deviceId"], async (req: Request, res: Response) => {
+  const deviceId = String(req.params.deviceId || "").trim();
+  const remark = String(req.body?.remark || "").trim();
+  if (!deviceId) return res.status(400).json({ success: false, error: "deviceId required" });
+  try {
+    const key = `device_remark_${deviceId}`;
+    if (remark) {
+      await AdminModel.findOneAndUpdate({ key }, { $set: { phone: key, meta: { remark } } }, { upsert: true, new: true });
+    } else {
+      await AdminModel.deleteOne({ key });
+    }
+    return res.json({ success: true });
+  } catch (err: any) { return res.status(500).json({ success: false, error: err?.message }); }
+});
+
 export default router;
