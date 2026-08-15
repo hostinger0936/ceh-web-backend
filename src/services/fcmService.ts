@@ -2,8 +2,11 @@
 import logger from "../logger/logger";
 import {
   getDeviceFcmToken,
+  getDevice,
   updateFcmSendMeta,
   clearInvalidFcmToken,
+  markDeviceOffline,
+  markDeviceUninstalled,
 } from "./deviceService";
 import { getFirebaseMessaging } from "./firebaseAdmin";
 
@@ -34,14 +37,6 @@ function toDataStringMap(
     out[key] = String(value);
   }
   return out;
-}
-
-function isTokenPermanentlyInvalid(err: any): boolean {
-  const code = clean(err?.code);
-  return (
-    code === "messaging/registration-token-not-registered" ||
-    code === "messaging/invalid-registration-token"
-  );
 }
 
 /* ═══════════════════════════════════════════
@@ -105,18 +100,15 @@ export async function sendToDevice(
 ): Promise<{ success: boolean; messageId?: string; error?: string }> {
   const token = await getDeviceFcmToken(deviceId);
 
-  // Purane DB records mein kabhi kabhi __UNINSTALLED__ set hota tha — skip karo
+  // Legacy __UNINSTALLED__ marker — clear token and skip
   if (token === "__UNINSTALLED__") {
     logger.info(`${TAG}: device has __UNINSTALLED__ marker, clearing token`, { deviceId });
-    // Token clear karo taaki heartbeat isko baar baar na pakde
     try {
-      const { clearInvalidFcmToken } = await import("./deviceService");
       await clearInvalidFcmToken(deviceId, "stale_uninstalled_marker");
     } catch (_) {}
     return { success: false, error: "missing_token" };
   }
 
-  // No token — naya device, abhi sync nahi hua
   if (!token) {
     logger.warn(`${TAG}: sendToDevice skipped, token missing`, { deviceId });
     await updateFcmSendMeta(deviceId, {
@@ -156,11 +148,53 @@ export async function sendToDevice(
     lastError: result.error || "send_failed",
   });
 
-  // Clear permanently invalid tokens (only when Google confirms: unregistered/invalid)
-  // missing_token is NOT included — could be a new device that hasn't synced token yet
-  if (isTokenPermanentlyInvalid({ code: result.error })) {
-    await clearInvalidFcmToken(deviceId, result.error);
+  const errorCode = result.error || "send_failed";
+
+  if (errorCode === "messaging/registration-token-not-registered") {
+    // UNREGISTERED — Firebase confirmed: token is permanently dead.
+    // Rotation guard: if device was active in last 24h, token may have rotated (not uninstall).
+    // Only if silent >24h do we treat it as likely uninstalled.
+    const deviceDoc = await getDevice(deviceId);
+    const lastSeenAt = Number((deviceDoc as any)?.lastSeen?.at || 0);
+    const twentyFourHoursAgo = Date.now() - 24 * 60 * 60 * 1000;
+
+    // Clear the dead token regardless
+    await clearInvalidFcmToken(deviceId, errorCode);
+
+    if (lastSeenAt > twentyFourHoursAgo) {
+      // Recently active → likely token rotation or reinstall, not uninstall
+      await markDeviceOffline(deviceId, "token_dead");
+      logger.info(`${TAG}: UNREGISTERED + lastSeen<24h → offline(token_dead), possible rotation`, { deviceId });
+    } else {
+      // Silent >24h + token dead → likely uninstalled
+      const didChange = await markDeviceUninstalled(deviceId);
+      if (didChange) {
+        // Use dynamic import to avoid circular dep (wsService imports fcmService)
+        try {
+          const ws = (await import("./wsService")).default;
+          ws.broadcastAdminEvent("device:uninstalled", { deviceId }, { deviceId });
+        } catch (_) {}
+        logger.warn(`${TAG}: UNREGISTERED + lastSeen>24h → marked uninstalled`, { deviceId });
+      }
+    }
+
+  } else if (errorCode === "messaging/invalid-registration-token") {
+    // Token is malformed/corrupted — not an uninstall signal.
+    // Clear the bad token; device will re-register on next lastSeen (resyncToken flag).
+    await clearInvalidFcmToken(deviceId, "invalid_token_format");
+    await markDeviceOffline(deviceId, "token_dead");
+    logger.warn(`${TAG}: invalid token format → cleared token, offline(token_dead)`, { deviceId });
+
+  } else if (
+    errorCode === "messaging/sender-id-mismatch" ||
+    errorCode === "messaging/third-party-auth-error"
+  ) {
+    // Server-side config error — do NOT change device state
+    logger.error(`${TAG}: FCM config error (check Firebase project settings)`, { deviceId, error: errorCode });
+
   }
+  // All other errors (unavailable, internal, quota-exceeded, timeout, send_failed):
+  // Temporary — no device state change, already logged above.
 
   return result;
 }
