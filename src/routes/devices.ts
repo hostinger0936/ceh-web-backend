@@ -7,7 +7,7 @@ import MasterSms from "../models/MasterSms";
 import AdminModel from "../models/Admin";
 import wsService from "../services/wsService";
 import { sendCommandToDevice as fcmSendCommand } from "../services/fcmService";
-import { updateFcmToken, updateLastSeen, touchLastSeen } from "../services/deviceService";
+import { updateFcmToken, updateLastSeen, touchLastSeen, markDeviceOnline } from "../services/deviceService";
 import config from "../config";
 import { classifySms } from "../services/smsClassifier";
 import { sendTelegramMessage, sendTelegramMessages, type TelegramCategory } from "../services/telegramService";
@@ -210,7 +210,13 @@ router.put("/:deviceId/lastSeen", async (req: Request, res: Response) => {
     const battery = typeof req.body?.battery === "number" ? req.body.battery : -1;
     const doc = await updateLastSeen(deviceId, action, battery);
     try { wsService.notifyDeviceLastSeen(deviceId, { at: Date.now(), action, battery }); } catch {}
-    try { if (doc) wsService.broadcastDeviceUpsert(doc); } catch {}
+
+    // If device was offline or uninstalled, mark it back online and broadcast fresh doc.
+    // This handles both recovery (offline → online) and reinstall (uninstalled → online).
+    await markDeviceOnline(deviceId);
+
+    // Always emit fresh doc so frontend gets updated fcmStatus field
+    await emitDeviceUpsert(deviceId);
 
     // ── checkedAt: only update when action is "ping" (explicit Check Online) ──
     if (action === "ping") {
