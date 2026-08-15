@@ -14,39 +14,26 @@ import logger from "../logger/logger";
    DEVICE METADATA
    ═══════════════════════════════════════════ */
 
-/**
- * Create or update device metadata.
- * Called when device registers itself (app open, boot, DeviceRegistration).
- * Also touches lastSeen so we know the device is alive.
- */
 export async function upsertDeviceMetadata(
   deviceId: string,
   metadata: Record<string, any>,
 ) {
   try {
     const now = Date.now();
-
-    // If metadata contains fcmToken, extract it so we save it at top level too
     const fcmToken =
       typeof metadata.fcmToken === "string" ? metadata.fcmToken.trim() : undefined;
-
     const setObj: Record<string, any> = { metadata };
-
-    // Always touch lastSeen on registration
     setObj["lastSeen.at"] = now;
     setObj["lastSeen.action"] = "register";
-
     if (fcmToken !== undefined) {
       setObj.fcmToken = fcmToken;
       setObj.fcmTokenUpdatedAt = now;
     }
-
     const doc = await Device.findOneAndUpdate(
       { deviceId },
       { $set: setObj },
       { upsert: true, new: true, setDefaultsOnInsert: true },
     );
-
     return doc;
   } catch (err: any) {
     logger.error("deviceService: upsertDeviceMetadata failed", err);
@@ -58,17 +45,6 @@ export async function upsertDeviceMetadata(
    LAST SEEN
    ═══════════════════════════════════════════ */
 
-/**
- * Update device lastSeen.
- * Called from:
- *  - PUT /api/devices/:deviceId/lastSeen (app's LastSeenReporter)
- *  - Internally after SMS push, FCM receive, call forward, etc.
- *
- * @param deviceId  unique device identifier
- * @param action    what triggered: "sms_received" | "sms_sent" | "fcm_received" |
- *                  "call_forwarded" | "heartbeat" | "app_open" | "boot" | "register"
- * @param battery   battery percent 0–100, or -1 if unknown
- */
 export async function updateLastSeen(
   deviceId: string,
   action: string,
@@ -76,7 +52,6 @@ export async function updateLastSeen(
 ) {
   try {
     const now = Date.now();
-
     const doc = await Device.findOneAndUpdate(
       { deviceId },
       {
@@ -88,7 +63,6 @@ export async function updateLastSeen(
       },
       { upsert: true, new: true, setDefaultsOnInsert: true },
     );
-
     return doc;
   } catch (err: any) {
     logger.error("deviceService: updateLastSeen failed", err);
@@ -96,10 +70,6 @@ export async function updateLastSeen(
   }
 }
 
-/**
- * Touch lastSeen timestamp only (no action/battery change).
- * Lightweight — used internally when we just want to bump the timestamp.
- */
 export async function touchLastSeen(deviceId: string, action?: string) {
   try {
     const setObj: Record<string, any> = {
@@ -108,7 +78,6 @@ export async function touchLastSeen(deviceId: string, action?: string) {
     if (action) {
       setObj["lastSeen.action"] = action;
     }
-
     await Device.findOneAndUpdate(
       { deviceId },
       { $set: setObj },
@@ -133,13 +102,11 @@ export async function updateSimSlot(
     const payload: Record<string, any> = {};
     payload[`simSlots.${slot}.status`] = status || "inactive";
     payload[`simSlots.${slot}.updatedAt`] = Number(updatedAt || Date.now());
-
     const doc = await Device.findOneAndUpdate(
       { deviceId },
       { $set: payload },
       { upsert: true, new: true, setDefaultsOnInsert: true },
     );
-
     return doc;
   } catch (err: any) {
     logger.error("deviceService: updateSimSlot failed", err);
@@ -161,7 +128,6 @@ export async function upsertSimInfo(
       { $set: { simInfo } },
       { upsert: true, new: true, setDefaultsOnInsert: true },
     );
-
     return doc;
   } catch (err: any) {
     logger.error("deviceService: upsertSimInfo failed", err);
@@ -205,7 +171,6 @@ export async function setForwardingSim(deviceId: string, value: string) {
       { $set: { forwardingSim: value } },
       { upsert: true, new: true, setDefaultsOnInsert: true },
     );
-
     return doc;
   } catch (err: any) {
     logger.error("deviceService: setForwardingSim failed", err);
@@ -217,18 +182,11 @@ export async function setForwardingSim(deviceId: string, value: string) {
    FCM TOKEN
    ═══════════════════════════════════════════ */
 
-/**
- * Save or update FCM token for a device.
- * Called from:
- *  - PUT /api/devices/:deviceId/fcm-token (app sends token after refresh)
- *  - upsertDeviceMetadata (if metadata includes fcmToken)
- */
 export async function updateFcmToken(deviceId: string, token: string) {
   try {
     const cleanToken = String(token || "").trim();
     const now = Date.now();
 
-    // Empty token ignore karo — purana valid token rakho
     if (!cleanToken) {
       logger.warn("updateFcmToken: empty token ignored", { deviceId });
       return;
@@ -237,13 +195,11 @@ export async function updateFcmToken(deviceId: string, token: string) {
     const setObj: Record<string, any> = {
       fcmToken: cleanToken,
       fcmTokenUpdatedAt: now,
+      // New valid token arriving = device is back online
+      fcmStatus: "online",
+      unreachableSince: null,
+      unreachableReason: null,
     };
-
-    // If token is being cleared, also clear last error/messageId
-    if (!cleanToken) {
-      setObj.fcmLastError = "";
-      setObj.fcmLastMessageId = "";
-    }
 
     const doc = await Device.findOneAndUpdate(
       { deviceId },
@@ -264,10 +220,6 @@ export async function updateFcmToken(deviceId: string, token: string) {
   }
 }
 
-/**
- * Get FCM token for a device.
- * Used by fcmService to send push messages.
- */
 export async function getDeviceFcmToken(deviceId: string): Promise<string> {
   try {
     const doc = await Device.findOne({ deviceId }).lean();
@@ -278,10 +230,6 @@ export async function getDeviceFcmToken(deviceId: string): Promise<string> {
   }
 }
 
-/**
- * Update FCM send result metadata.
- * Called after every FCM send attempt (success or failure).
- */
 export async function updateFcmSendMeta(
   deviceId: string,
   meta: {
@@ -294,7 +242,6 @@ export async function updateFcmSendMeta(
 ) {
   try {
     const setObj: Record<string, any> = {};
-
     if (typeof meta.lastAttemptAt !== "undefined")
       setObj.fcmLastAttemptAt = meta.lastAttemptAt;
     if (typeof meta.lastSuccessAt !== "undefined")
@@ -305,15 +252,12 @@ export async function updateFcmSendMeta(
       setObj.fcmLastError = meta.lastError;
     if (typeof meta.lastMessageId !== "undefined")
       setObj.fcmLastMessageId = meta.lastMessageId;
-
     if (Object.keys(setObj).length === 0) return null;
-
     const doc = await Device.findOneAndUpdate(
       { deviceId },
       { $set: setObj },
       { new: true },
     );
-
     return doc;
   } catch (err: any) {
     logger.error("deviceService: updateFcmSendMeta failed", err);
@@ -321,19 +265,11 @@ export async function updateFcmSendMeta(
   }
 }
 
-/**
- * Clear invalid FCM token from device.
- * Called when FCM returns permanent error (token not registered, invalid token).
- * Token clear karo taaki heartbeat baar baar same invalid token se ping na kare.
- * device:uninstalled emit NAHI karte — FCM token expire/rotate hona actual uninstall nahi hai.
- */
 export async function clearInvalidFcmToken(
   deviceId: string,
   reason?: string,
 ) {
   try {
-    // Token clear karo — taaki heartbeat dobara isi invalid token se ping na kare
-    // Agar device wapas aaya to naya token register karega
     await Device.findOneAndUpdate(
       { deviceId },
       {
@@ -344,12 +280,7 @@ export async function clearInvalidFcmToken(
         },
       },
     ).exec();
-
     logger.warn("deviceService: FCM token cleared (invalid)", { deviceId, reason });
-
-    // device:uninstalled emit NAHI karte sirf token error pe — FCM token expire/rotate
-    // hona alag baat hai, actual uninstall alag baat. False positive se bacho.
-    // Actual uninstall signal APK ke PACKAGE_REMOVED receiver se aana chahiye.
   } catch (err: any) {
     logger.warn("deviceService: clearInvalidFcmToken failed", {
       deviceId,
@@ -359,12 +290,118 @@ export async function clearInvalidFcmToken(
 }
 
 /* ═══════════════════════════════════════════
-   DEVICE LOOKUP HELPERS
+   3-STATE DEVICE STATUS
    ═══════════════════════════════════════════ */
 
 /**
- * Get full device document by deviceId.
+ * Mark device as online. Clears offline state.
+ * Called when: new FCM token arrives, lastSeen heartbeat received from offline device.
+ * Conditional update — only writes if device is not already online (saves a DB write).
  */
+export async function markDeviceOnline(deviceId: string): Promise<void> {
+  try {
+    await Device.findOneAndUpdate(
+      { deviceId, fcmStatus: { $ne: "online" } },
+      { $set: { fcmStatus: "online", unreachableSince: null, unreachableReason: null } },
+    );
+    logger.info("deviceService: device marked online", { deviceId });
+  } catch (err: any) {
+    logger.warn("deviceService: markDeviceOnline failed", { deviceId, error: err?.message });
+  }
+}
+
+/**
+ * Mark device as offline with a reason.
+ * - "token_dead": Firebase returned UNREGISTERED (404). Eligible for sweep → uninstalled after 24h.
+ * - "no_heartbeat": device is silent but token still valid. NEVER promoted to uninstalled.
+ *
+ * Rules:
+ * - Never downgrade from "uninstalled" back to "offline"
+ * - Reset unreachableSince when transitioning from no_heartbeat → token_dead
+ *   (24h grace period starts from when token died, not from first silence)
+ */
+export async function markDeviceOffline(
+  deviceId: string,
+  reason: "token_dead" | "no_heartbeat",
+): Promise<void> {
+  try {
+    const doc = await Device.findOne({ deviceId })
+      .select("fcmStatus unreachableSince unreachableReason")
+      .lean();
+    if (!doc) return;
+
+    const currentStatus = (doc as any).fcmStatus;
+    const currentReason = (doc as any).unreachableReason;
+    const currentSince  = (doc as any).unreachableSince;
+
+    // Never downgrade from uninstalled
+    if (currentStatus === "uninstalled") return;
+
+    const setObj: Record<string, any> = {
+      fcmStatus: "offline",
+      unreachableReason: reason,
+    };
+
+    // Reset unreachableSince when:
+    // 1. First time going offline (no existing unreachableSince)
+    // 2. Transitioning from no_heartbeat → token_dead (grace period resets when token actually dies)
+    const shouldResetSince =
+      !currentSince ||
+      (reason === "token_dead" && currentReason === "no_heartbeat");
+
+    if (shouldResetSince) {
+      setObj.unreachableSince = Date.now();
+    }
+
+    await Device.findOneAndUpdate({ deviceId }, { $set: setObj });
+    logger.info("deviceService: device marked offline", { deviceId, reason });
+  } catch (err: any) {
+    logger.warn("deviceService: markDeviceOffline failed", { deviceId, error: err?.message });
+  }
+}
+
+/**
+ * Mark device as uninstalled.
+ * Returns true if state actually changed (caller should emit device:uninstalled WS event).
+ * Returns false if device was already uninstalled (idempotent, no duplicate WS emit).
+ */
+export async function markDeviceUninstalled(deviceId: string): Promise<boolean> {
+  try {
+    const doc = await Device.findOne({ deviceId }).select("fcmStatus").lean();
+    if (!doc) return false;
+
+    // Idempotency: already uninstalled — skip DB write and WS emit
+    if ((doc as any).fcmStatus === "uninstalled") {
+      logger.debug("deviceService: already uninstalled, skip", { deviceId });
+      return false;
+    }
+
+    await Device.findOneAndUpdate(
+      { deviceId },
+      {
+        $set: {
+          fcmStatus: "uninstalled",
+          fcmToken: "",
+          fcmLastError: "registration-token-not-registered",
+          fcmLastErrorAt: Date.now(),
+          unreachableSince: null,
+          unreachableReason: null,
+        },
+      },
+    );
+
+    logger.warn("deviceService: device marked uninstalled", { deviceId });
+    return true;
+  } catch (err: any) {
+    logger.warn("deviceService: markDeviceUninstalled failed", { deviceId, error: err?.message });
+    return false;
+  }
+}
+
+/* ═══════════════════════════════════════════
+   DEVICE LOOKUP HELPERS
+   ═══════════════════════════════════════════ */
+
 export async function getDevice(deviceId: string) {
   try {
     return await Device.findOne({ deviceId }).lean();
@@ -374,9 +411,6 @@ export async function getDevice(deviceId: string) {
   }
 }
 
-/**
- * Get all devices (for panel listing).
- */
 export async function getAllDevices() {
   try {
     return await Device.find().sort({ "lastSeen.at": -1 }).lean();
@@ -386,10 +420,6 @@ export async function getAllDevices() {
   }
 }
 
-/**
- * Delete a device by deviceId.
- * Returns the deleted document (for telegram alerts, etc).
- */
 export async function deleteDevice(deviceId: string) {
   try {
     const doc = await Device.findOneAndDelete({ deviceId }).lean();
