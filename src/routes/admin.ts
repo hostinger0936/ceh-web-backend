@@ -51,6 +51,12 @@ function recordPanelSuccess(panelId: string) {
   logger.info(`repack: daily usage recorded for ${panelId}, total today: ${times.length}`);
 }
 
+function getPanelInFlight(panelId: string): number {
+  const queued = repackQueue.filter(q => repackJobs.get(q.requestId)?.panelId === panelId).length;
+  const running = [...repackJobs.values()].filter(j => j.status === "running" && j.panelId === panelId).length;
+  return queued + running;
+}
+
 // ─── Admin APK Job Store ──────────────────────────────────────────────────────
 interface AdminApkJob {
   status: "pending" | "done" | "error";
@@ -559,12 +565,13 @@ router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: 
     const panelId = clean(req.body?.panelId || process.env.PANEL_ID || "");
     if (!panelId) return res.status(400).json({ error: "panelId required" });
 
-    // Check 24h daily limit (only counts successful repacks)
+    // Check 24h daily limit (counts successful repacks + currently in-flight)
     const dailyUsed = getPanelDailyUsed(panelId);
-    if (dailyUsed >= DAILY_REPACK_LIMIT) {
+    const totalUsed = dailyUsed + getPanelInFlight(panelId);
+    if (totalUsed >= DAILY_REPACK_LIMIT) {
       return res.status(429).json({
         error: "24 ghante mein sirf 2 baar fix ho sakta hai. Kal dobara aao.",
-        dailyUsed,
+        dailyUsed: totalUsed,
         dailyLimit: DAILY_REPACK_LIMIT,
       });
     }
