@@ -224,33 +224,6 @@ async function run() {
       }
     }
 
-    // Bulk mark: devices silent 2h+ with a valid token that are still showing "online"
-    // → set to offline(no_heartbeat). Only runs on first transition (condition guards).
-    // no_heartbeat devices are NEVER swept to uninstalled — only token_dead ones are.
-    try {
-      const marked = await Device.updateMany(
-        {
-          "lastSeen.at": { $gt: 0, $lte: now - UNREACHABLE_THRESHOLD_MS },
-          fcmToken: { $ne: "" },
-          fcmStatus: { $in: ["online", null] },
-        },
-        {
-          $set: {
-            fcmStatus: "offline",
-            unreachableReason: "no_heartbeat",
-            unreachableSince: now,
-          },
-        },
-      );
-      if (marked.modifiedCount > 0) {
-        logger.info("heartbeatWorker: marked devices offline(no_heartbeat)", {
-          count: marked.modifiedCount,
-        });
-      }
-    } catch (e) {
-      logger.warn("heartbeatWorker: bulk offline mark failed", e);
-    }
-
     // Sweep: promote offline(token_dead) for 24h+ → uninstalled
     await runSweep();
 
