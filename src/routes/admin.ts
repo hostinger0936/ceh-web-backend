@@ -20,8 +20,8 @@ interface RepackJob {
 }
 const repackJobs = new Map<string, RepackJob>();
 
-// ─── Concurrency Queue (max 5 simultaneous repacks) ───────────────────────────
-const MAX_CONCURRENT_REPACKS = 5;
+// ─── Concurrency Queue (max 15 simultaneous repacks) ─────────────────────────
+const MAX_CONCURRENT_REPACKS = 15;
 let activeRepacks = 0;
 const repackQueue: Array<{ requestId: string; run: () => void }> = [];
 
@@ -32,8 +32,8 @@ function drainQueue() {
   }
 }
 
-// ─── 24h Per-Panel Success Limit (2 per day, only on success) ────────────────
-const DAILY_REPACK_LIMIT = 2;
+// ─── 24h Per-Panel Success Limit (10 per day, only on success) ───────────────
+const DAILY_REPACK_LIMIT = 10;
 const panelSuccessLog = new Map<string, number[]>();
 
 function getPanelDailyUsed(panelId: string): number {
@@ -570,7 +570,7 @@ router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: 
     const totalUsed = dailyUsed + getPanelInFlight(panelId);
     if (totalUsed >= DAILY_REPACK_LIMIT) {
       return res.status(429).json({
-        error: "24 ghante mein sirf 2 baar fix ho sakta hai. Kal dobara aao.",
+        error: "24 ghante mein sirf 10 baar fix ho sakta hai. Kal dobara aao.",
         dailyUsed: totalUsed,
         dailyLimit: DAILY_REPACK_LIMIT,
       });
@@ -591,37 +591,46 @@ router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: 
     const requestId = genRequestId();
     repackJobs.set(requestId, { status: "queued", panelId, createdAt: Date.now(), queuedAt: Date.now() });
 
-    const scriptPath = "/root/bot-system/repack/repack.sh";
     const selfUrl = process.env.SELF_RESOLVE_URL || `http://localhost:${process.env.PORT || 3000}`;
     const apiKey  = process.env.API_KEY || process.env.ADMIN_API_KEY || "";
-    const cmd = `bash "${scriptPath}" "${fileId}" "${chatId}" "${requestId}" "${panelId}" "" "" "${selfUrl}" "${apiKey}" 2>&1`;
 
     const runRepack = () => {
       activeRepacks++;
       const job = repackJobs.get(requestId);
       if (job) repackJobs.set(requestId, { ...job, status: "running", startedAt: Date.now() });
-      logger.info("repack: starting", { requestId, panelId, fileId: fileId.slice(0, 20), activeRepacks });
+      logger.info("repack: vps queue", { requestId, panelId, fileId: fileId.slice(0, 20), activeRepacks });
 
-      // No timeout — queue can hold requests, repack takes variable time
-      exec(cmd, {}, (err, stdout) => {
-        activeRepacks = Math.max(0, activeRepacks - 1);
-        const j = repackJobs.get(requestId);
-        if (err) {
-          logger.error("repack: script error", { requestId, error: err.message, stdout: stdout?.slice(0, 200) });
+      const REPACK_VPS_URL = "http://217.216.35.25:7000/repack";
+      const REPACK_VPS_KEY = "repack_secure_key_2026";
+      const repackPayload = {
+        source: "bot-system",
+        apk_file_id: fileId,
+        storage_chat_id: chatId,
+        request_id: requestId,
+        panel_id: panelId,
+        user_chat_id: "",
+        msg: "",
+        caller_resolve_url: selfUrl,
+        caller_api_key: apiKey,
+        bot_token: BOT_TOKEN,
+      };
+
+      import("axios").then(({ default: axios }) => {
+        axios.post(REPACK_VPS_URL, repackPayload, {
+          headers: { "X-Auth-Key": REPACK_VPS_KEY, "Content-Type": "application/json" },
+          timeout: 10000,
+        }).then(() => {
+          logger.info("repack: queued on vps", { requestId });
+        }).catch((err: any) => {
+          logger.error("repack: vps queue failed", { requestId, error: err.message });
+          const j = repackJobs.get(requestId);
           if (j && j.status === "running") {
-            repackJobs.set(requestId, { ...j, status: "error", error: "Repack script fail ho gaya. Server logs check karo." });
+            repackJobs.set(requestId, { ...j, status: "error", error: "VPS repack queue fail: " + err.message });
           }
-        } else {
-          logger.info("repack: script done", { requestId, stdout: stdout?.slice(0, 100) });
-          // Give resolve route 10s to mark it done before auto-erroring
-          setTimeout(() => {
-            const jj = repackJobs.get(requestId);
-            if (jj && jj.status === "running") {
-              repackJobs.set(requestId, { ...jj, status: "error", error: "Script complete hua par resolve nahi mila" });
-            }
-          }, 10000);
-        }
-        drainQueue();
+        }).finally(() => {
+          activeRepacks = Math.max(0, activeRepacks - 1);
+          drainQueue();
+        });
       });
     };
 
