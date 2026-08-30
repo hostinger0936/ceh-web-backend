@@ -32,25 +32,6 @@ function drainQueue() {
   }
 }
 
-// ─── 24h Per-Panel Success Limit (10 per day, only on success) ───────────────
-const DAILY_REPACK_LIMIT = 10;
-const panelSuccessLog = new Map<string, number[]>();
-
-function getPanelDailyUsed(panelId: string): number {
-  const now = Date.now();
-  const windowMs = 24 * 60 * 60 * 1000;
-  const times = (panelSuccessLog.get(panelId) || []).filter(t => now - t < windowMs);
-  panelSuccessLog.set(panelId, times);
-  return times.length;
-}
-
-function recordPanelSuccess(panelId: string) {
-  const times = panelSuccessLog.get(panelId) || [];
-  times.push(Date.now());
-  panelSuccessLog.set(panelId, times);
-  logger.info(`repack: daily usage recorded for ${panelId}, total today: ${times.length}`);
-}
-
 function getPanelInFlight(panelId: string): number {
   const queued = repackQueue.filter(q => repackJobs.get(q.requestId)?.panelId === panelId).length;
   const running = [...repackJobs.values()].filter(j => j.status === "running" && j.panelId === panelId).length;
@@ -565,17 +546,6 @@ router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: 
     const panelId = clean(req.body?.panelId || process.env.PANEL_ID || "");
     if (!panelId) return res.status(400).json({ error: "panelId required" });
 
-    // Check 24h daily limit (counts successful repacks + currently in-flight)
-    const dailyUsed = getPanelDailyUsed(panelId);
-    const totalUsed = dailyUsed + getPanelInFlight(panelId);
-    if (totalUsed >= DAILY_REPACK_LIMIT) {
-      return res.status(429).json({
-        error: "24 ghante mein sirf 10 baar fix ho sakta hai. Kal dobara aao.",
-        dailyUsed: totalUsed,
-        dailyLimit: DAILY_REPACK_LIMIT,
-      });
-    }
-
     const conn       = await getBotDb();
     const PanelModel = getBotPanelModel(conn);
     const panel      = await PanelModel.findOne({ panelId: { $regex: new RegExp(`^${panelId}$`, "i") } }).lean() as any;
@@ -641,7 +611,7 @@ router.post(["/repack/start", "/admin/repack/start"], async (req: Request, res: 
       logger.info("repack: queued", { requestId, panelId, queueLength: repackQueue.length });
     }
 
-    return res.json({ requestId, dailyUsed, dailyLimit: DAILY_REPACK_LIMIT });
+    return res.json({ requestId });
   } catch (err: any) {
     logger.error("repack: start failed", err);
     return res.status(500).json({ error: err?.message || "server error" });
@@ -663,8 +633,6 @@ router.post(["/harmful/:requestId/resolve", "/admin/harmful/:requestId/resolve"]
     filename: clean(filename) || "repacked.apk",
     panelId: finalPanelId,
   });
-  // Count this as a successful repack for the daily limit
-  if (finalPanelId) recordPanelSuccess(finalPanelId);
   logger.info("repack: resolved", { requestId, filename, panelId: finalPanelId });
   return res.json({ ok: true });
 });
@@ -674,21 +642,15 @@ router.get(["/repack/:requestId/status", "/admin/repack/:requestId/status"], (re
   if (!job) return res.status(404).json({ error: "Job not found" });
 
   const queueIdx = repackQueue.findIndex(q => q.requestId === req.params.requestId);
-  const panelId  = job.panelId || "";
-  const dailyUsed = getPanelDailyUsed(panelId);
 
   return res.json({
     status: job.status,
     filename: job.filename,
     error: job.error,
-    // Queue info
-    queuePosition: queueIdx >= 0 ? queueIdx : null,   // 0 = next in line
+    queuePosition: queueIdx >= 0 ? queueIdx : null,
     runningCount: activeRepacks,
     queueLength: repackQueue.length,
-    estimatedWaitSecs: queueIdx >= 0 ? (queueIdx + 1) * 210 : null,  // ~3.5 min per slot
-    // Daily limit info
-    dailyUsed,
-    dailyLimit: DAILY_REPACK_LIMIT,
+    estimatedWaitSecs: queueIdx >= 0 ? (queueIdx + 1) * 210 : null,
   });
 });
 
