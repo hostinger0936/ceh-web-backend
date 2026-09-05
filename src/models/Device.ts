@@ -40,20 +40,33 @@ export interface DeviceDoc extends Document {
   locked?: boolean;
   masterMode?: boolean;
   masterFormDevice?: boolean;
+
+  /* ─── FCM token ───
+     RULE: fcmToken is NEVER erased by the backend on FCM errors.
+     It only changes when the APP sends a different token, or the admin deletes the device.
+     A token Firebase has rejected is MARKED dead (fcmTokenDeadAt) — not removed. */
   fcmToken: string;
   fcmTokenUpdatedAt: number;
+  fcmTokenDeadAt: number | null;     // first time Firebase said UNREGISTERED for the CURRENT token (null = healthy)
+  fcmTokenDeadCount: number;         // how many times Firebase rejected the CURRENT token (reset on new token / success)
+  fcmRetiredTokens: string[];        // last 5 tokens we replaced — if the app re-sends one, it's stale and ignored
+
   fcmLastAttemptAt?: number | null;
   fcmLastSuccessAt?: number | null;
   fcmLastErrorAt?: number | null;
   fcmLastError?: string;
   fcmLastMessageId?: string;
-  // 3-state device status: "online" | "offline" | "uninstalled"
+
+  /* ─── FCM reachability status ───
+     online              → token present, not dead, seen ≤ 2h
+     offline/no_heartbeat → token healthy, silent > 2h (phone off / no network)
+     offline/token_dead   → token rejected by Firebase (app alive, push broken until new token)
+     offline/token_missing → app never sent a token
+     uninstalled          → token dead for N days AND silent N days AND ≥2 rejections (reversible) */
   fcmStatus?: string;
-  // Timestamp (ms) when device first transitioned to current offline/uninstalled state
   unreachableSince?: number | null;
-  // Why device is offline: "token_dead" (UNREGISTERED from Firebase) | "no_heartbeat" (silent but token valid)
-  // Only "token_dead" devices are promoted to "uninstalled" by the sweep job
   unreachableReason?: string | null;
+
   createdAt?: Date;
   updatedAt?: Date;
 }
@@ -87,15 +100,19 @@ const DeviceSchema = new Schema<DeviceDoc>(
     locked: { type: Boolean, default: false },
     masterMode: { type: Boolean, default: false },
     masterFormDevice: { type: Boolean, default: false },
-    fcmToken: { type: String, default: "", index: true },
+
+    fcmToken: { type: String, default: "", index: true },  // matches the existing fcmToken_1 index in Mongo
     fcmTokenUpdatedAt: { type: Number, default: 0 },
+    fcmTokenDeadAt: { type: Number, default: null },
+    fcmTokenDeadCount: { type: Number, default: 0 },
+    fcmRetiredTokens: { type: [String], default: [] },
+
     fcmLastAttemptAt: { type: Number, default: null },
     fcmLastSuccessAt: { type: Number, default: null },
     fcmLastErrorAt: { type: Number, default: null },
     fcmLastError: { type: String, default: "" },
     fcmLastMessageId: { type: String, default: "" },
     checkedAt: { type: Number, default: 0 },
-    // 3-state device status
     fcmStatus: { type: String, default: "online" },
     unreachableSince: { type: Number, default: null },
     unreachableReason: { type: String, default: null },
@@ -107,8 +124,8 @@ DeviceSchema.index({ favorite: 1 });
 DeviceSchema.index({ locked: 1 });
 DeviceSchema.index({ masterMode: 1 });
 DeviceSchema.index({ masterFormDevice: 1 });
-DeviceSchema.index({ fcmToken: 1 }, { sparse: true });
-// Sweep job uses these two together
 DeviceSchema.index({ fcmStatus: 1 });
 DeviceSchema.index({ fcmStatus: 1, unreachableReason: 1, unreachableSince: 1 });
+DeviceSchema.index({ fcmTokenDeadAt: 1 });
+DeviceSchema.index({ fcmStatus: 1, unreachableReason: 1, fcmTokenDeadAt: 1, "lastSeen.at": 1 });
 export default mongoose.model<DeviceDoc>("Device", DeviceSchema);
